@@ -1,0 +1,301 @@
+name: 一键同步 Tag、Release 与 Docker 镜像
+run-name: "${{ inputs.operation }} / ${{ inputs.copy_mode }} / ${{ inputs.tag }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "执行操作"
+        required: true
+        type: choice
+        default: copy_release
+        options:
+          - check_pat
+          - sync_missing_tags
+          - copy_release
+          - copy_docker
+      src_repo:
+        description: "源仓库 owner/repo，留空自动识别 Fork 上游"
+        required: false
+        type: string
+        default: ""
+      image_mappings:
+        description: "Docker 映射，多个用分号分隔；留空自动使用上游 GHCR"
+        required: false
+        type: string
+        default: ""
+      copy_mode:
+        description: "版本选择方式"
+        required: true
+        type: choice
+        default: single
+        options:
+          - single
+          - multiple
+          - all
+          - date
+          - range
+      tag:
+        description: "单个版本，例如 v1.6.3"
+        required: false
+        type: string
+        default: ""
+      tag_list:
+        description: "多个版本，使用逗号或空格分隔"
+        required: false
+        type: string
+        default: ""
+      start_date:
+        description: "开始日期，例如 2026-01-01"
+        required: false
+        type: string
+        default: ""
+      end_date:
+        description: "结束日期，例如 2026-12-31"
+        required: false
+        type: string
+        default: ""
+      from_tag:
+        description: "起始版本，例如 v1.0.0"
+        required: false
+        type: string
+        default: ""
+      to_tag:
+        description: "结束版本，例如 v1.6.3"
+        required: false
+        type: string
+        default: ""
+      overwrite_assets:
+        description: "覆盖同名 Release 附件"
+        required: true
+        type: boolean
+        default: true
+      include_drafts:
+        description: "包含草稿 Release"
+        required: true
+        type: boolean
+        default: false
+      include_prereleases:
+        description: "包含预发布版本"
+        required: true
+        type: boolean
+        default: true
+      docker_skip_existing:
+        description: "目标 Docker 镜像版本已存在时跳过"
+        required: true
+        type: boolean
+        default: true
+      strip_v_prefix:
+        description: "读取源 Docker Tag 时去掉开头 v"
+        required: true
+        type: boolean
+        default: false
+      update_latest:
+        description: "每个镜像将最后一个成功版本同时更新为 latest"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: all-in-one-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      src_repo: ${{ steps.repo.outputs.src_repo }}
+      target_repo: ${{ steps.repo.outputs.target_repo }}
+      selected_json: ${{ steps.select.outputs.selected_json }}
+      selected_count: ${{ steps.select.outputs.selected_count }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      INPUT_SRC_REPO: ${{ inputs.src_repo }}
+      TARGET_REPO: ${{ github.repository }}
+      COPY_MODE: ${{ inputs.copy_mode }}
+      SINGLE_TAG: ${{ inputs.tag }}
+      TAG_LIST: ${{ inputs.tag_list }}
+      START_DATE: ${{ inputs.start_date }}
+      END_DATE: ${{ inputs.end_date }}
+      FROM_TAG: ${{ inputs.from_tag }}
+      TO_TAG: ${{ inputs.to_tag }}
+      INCLUDE_DRAFTS: ${{ inputs.include_drafts }}
+      INCLUDE_PRERELEASES: ${{ inputs.include_prereleases }}
+    steps:
+      - name: 自动识别源仓库
+        id: repo
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_SRC_REPO}" ]; then
+            SRC_REPO="${INPUT_SRC_REPO}"
+          else
+            INFO="$(gh api "repos/${TARGET_REPO}")"
+            SRC_REPO="$(jq -r '.parent.full_name // .full_name' <<< "${INFO}")"
+          fi
+          printf '%s' "${SRC_REPO}" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || { echo "::error::源仓库格式错误"; exit 1; }
+          echo "源仓库：${SRC_REPO}"
+          echo "目标仓库：${TARGET_REPO}"
+          echo "src_repo=${SRC_REPO}" >> "${GITHUB_OUTPUT}"
+          echo "target_repo=${TARGET_REPO}" >> "${GITHUB_OUTPUT}"
+
+      - name: 选择 Release 版本
+        id: select
+        if: ${{ inputs.operation == 'copy_release' || inputs.operation == 'copy_docker' }}
+        shell: bash
+        env:
+          SRC_REPO: ${{ steps.repo.outputs.src_repo }}
+        run: |
+          set -euo pipefail
+          ALL="${RUNNER_TEMP}/all.json"; OUT="${RUNNER_TEMP}/selected.json"
+          gh release list -R "${SRC_REPO}" --limit 1000 --order asc --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease > "${ALL}"
+          [ "$(jq length "${ALL}")" -gt 0 ] || { echo "::error::源仓库没有 Release"; exit 1; }
+          case "${COPY_MODE}" in
+            single)
+              [ -n "${SINGLE_TAG}" ] || { echo "::error::必须填写 tag"; exit 1; }
+              jq --arg t "${SINGLE_TAG}" '[.[]|select(.tagName==$t)]' "${ALL}" > "${OUT}" ;;
+            multiple)
+              [ -n "${TAG_LIST}" ] || { echo "::error::必须填写 tag_list"; exit 1; }
+              L="${RUNNER_TEMP}/list"; printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^$/d' | sort -u > "${L}"
+              jq --rawfile x "${L}" '($x|split("\n")|map(select(length>0))) as $w|[.[]|select(.tagName as $t|$w|index($t))]' "${ALL}" > "${OUT}"
+              F="${RUNNER_TEMP}/found"; M="${RUNNER_TEMP}/missing"; jq -r '.[].tagName' "${OUT}" | sort -u > "${F}"; comm -23 "${L}" "${F}" > "${M}"
+              [ ! -s "${M}" ] || { echo "::error::不存在的版本："; cat "${M}"; exit 1; } ;;
+            all) cp "${ALL}" "${OUT}" ;;
+            date)
+              [ -n "${START_DATE}" ] && [ -n "${END_DATE}" ] || { echo "::error::必须填写日期"; exit 1; }
+              date -d "${START_DATE}" >/dev/null; date -d "${END_DATE}" >/dev/null
+              S="$(date -u -d "${START_DATE} 00:00:00" +%Y-%m-%dT%H:%M:%SZ)"; E="$(date -u -d "${END_DATE} 23:59:59" +%Y-%m-%dT%H:%M:%SZ)"
+              [[ "${S}" < "${E}" || "${S}" == "${E}" ]] || { echo "::error::日期顺序错误"; exit 1; }
+              jq --arg s "${S}" --arg e "${E}" '[.[]|select((.publishedAt//.createdAt)>=$s and (.publishedAt//.createdAt)<=$e)]' "${ALL}" > "${OUT}" ;;
+            range)
+              [ -n "${FROM_TAG}" ] && [ -n "${TO_TAG}" ] || { echo "::error::必须填写起止版本"; exit 1; }
+              A="$(jq --arg t "${FROM_TAG}" 'map(.tagName)|index($t)' "${ALL}")"; B="$(jq --arg t "${TO_TAG}" 'map(.tagName)|index($t)' "${ALL}")"
+              [ "${A}" != null ] && [ "${B}" != null ] || { echo "::error::起止版本不存在"; exit 1; }
+              if [ "${A}" -gt "${B}" ]; then T="${A}"; A="${B}"; B="${T}"; fi
+              jq --argjson a "${A}" --argjson b "${B}" '.[$a:($b+1)]' "${ALL}" > "${OUT}" ;;
+            *) echo "::error::未知模式"; exit 1 ;;
+          esac
+          if [ "${INCLUDE_DRAFTS}" != true ]; then jq '[.[]|select(.isDraft==false)]' "${OUT}" > "${OUT}.x"; mv "${OUT}.x" "${OUT}"; fi
+          if [ "${INCLUDE_PRERELEASES}" != true ]; then jq '[.[]|select(.isPrerelease==false)]' "${OUT}" > "${OUT}.x"; mv "${OUT}.x" "${OUT}"; fi
+          C="$(jq length "${OUT}")"; [ "${C}" -gt 0 ] || { echo "::error::没有选中版本"; exit 1; }
+          jq -r '.[]|"版本：\(.tagName) | 日期：\(.publishedAt//.createdAt)"' "${OUT}"
+          echo "selected_json=$(jq -c . "${OUT}")" >> "${GITHUB_OUTPUT}"; echo "selected_count=${C}" >> "${GITHUB_OUTPUT}"
+
+  check-pat:
+    needs: prepare
+    if: ${{ inputs.operation == 'check_pat' || inputs.operation == 'sync_missing_tags' }}
+    runs-on: ubuntu-24.04
+    env:
+      TOKEN: ${{ secrets.WORKFLOW_PAT }}
+      TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
+    steps:
+      - name: 检查 WORKFLOW_PAT
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${TOKEN:-}" ] || { echo "::error::没有配置 WORKFLOW_PAT"; exit 1; }
+          CODE="$(curl -sS -o "${RUNNER_TEMP}/repo.json" -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${TARGET_REPO}")"
+          [ "${CODE}" = 200 ] || { echo "::error::PAT 无效或无法访问仓库，HTTP ${CODE}"; exit 1; }
+          [ "$(jq -r '.permissions.push//false' "${RUNNER_TEMP}/repo.json")" = true ] || { echo "::error::PAT 没有写权限"; exit 1; }
+          echo "WORKFLOW_PAT 检查通过"
+
+  sync-tags:
+    needs: [prepare, check-pat]
+    if: ${{ inputs.operation == 'sync_missing_tags' }}
+    runs-on: ubuntu-24.04
+    env:
+      TOKEN: ${{ secrets.WORKFLOW_PAT }}
+      SRC_REPO: ${{ needs.prepare.outputs.src_repo }}
+      TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
+    steps:
+      - name: 只同步缺少的 Tag 和源码对象
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "${SRC_REPO}" != "${TARGET_REPO}" ] || { echo "源和目标相同"; exit 0; }
+          W="$(mktemp -d)"; trap 'rm -rf "${W}"' EXIT; S="https://github.com/${SRC_REPO}.git"; T="https://x-access-token:${TOKEN}@github.com/${TARGET_REPO}.git"
+          git -C "${W}" init -q; git -C "${W}" remote add upstream "${S}"
+          git ls-remote --tags --refs "${S}" | awk '{sub("refs/tags/","",$2);print $2}' | sort -u > "${W}/s"
+          git ls-remote --tags --refs "${T}" | awk '{sub("refs/tags/","",$2);print $2}' | sort -u > "${W}/t"
+          comm -23 "${W}/s" "${W}/t" > "${W}/m"; OK=0; FAIL=0
+          while IFS= read -r tag; do [ -n "${tag}" ] || continue; if git -C "${W}" fetch --force upstream "refs/tags/${tag}:refs/tags/${tag}" && git -C "${W}" push "${T}" "refs/tags/${tag}:refs/tags/${tag}"; then OK=$((OK+1)); else FAIL=$((FAIL+1)); fi; done < "${W}/m"
+          echo "成功 ${OK}，失败 ${FAIL}。已有 Tag 未覆盖、未修改、未删除。"; [ "${FAIL}" -eq 0 ]
+
+  copy-release:
+    needs: prepare
+    if: ${{ inputs.operation == 'copy_release' }}
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SRC_REPO: ${{ needs.prepare.outputs.src_repo }}
+      TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
+      SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
+      OVERWRITE: ${{ inputs.overwrite_assets }}
+    steps:
+      - name: 搬运 Release 标题、说明、状态和附件
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "${SELECTED_JSON}" > "${RUNNER_TEMP}/selected.json"; OK=0; FAIL=0
+          while IFS= read -r tag; do
+            W="$(mktemp -d)"; mkdir -p "${W}/assets"
+            if ! gh release view "${tag}" -R "${SRC_REPO}" --json name,body,isDraft,isPrerelease,tagName > "${W}/i.json"; then FAIL=$((FAIL+1)); rm -rf "${W}"; continue; fi
+            title="$(jq -r '.name//.tagName' "${W}/i.json")"; jq -r '.body//""' "${W}/i.json" > "${W}/body"; draft="$(jq -r .isDraft "${W}/i.json")"; pre="$(jq -r .isPrerelease "${W}/i.json")"
+            gh release download "${tag}" -R "${SRC_REPO}" -D "${W}/assets" || true
+            if gh release view "${tag}" -R "${TARGET_REPO}" >/dev/null 2>&1; then args=(release edit "${tag}" -R "${TARGET_REPO}" --title "${title}" --notes-file "${W}/body" --draft="${draft}" --prerelease="${pre}"); else args=(release create "${tag}" -R "${TARGET_REPO}" --title "${title}" --notes-file "${W}/body"); git ls-remote --exit-code --tags --refs "https://github.com/${TARGET_REPO}.git" "refs/tags/${tag}" >/dev/null 2>&1 && args+=(--verify-tag); [ "${draft}" = true ] && args+=(--draft); [ "${pre}" = true ] && args+=(--prerelease); fi
+            if gh "${args[@]}"; then mapfile -d '' files < <(find "${W}/assets" -maxdepth 1 -type f -print0); if [ "${#files[@]}" -gt 0 ]; then up=(release upload "${tag}" -R "${TARGET_REPO}"); [ "${OVERWRITE}" = true ] && up+=(--clobber); up+=("${files[@]}"); gh "${up[@]}"; fi; OK=$((OK+1)); else FAIL=$((FAIL+1)); fi
+            rm -rf "${W}"
+          done < <(jq -r '.[].tagName' "${RUNNER_TEMP}/selected.json")
+          echo "成功 ${OK}，失败 ${FAIL}"; [ "${FAIL}" -eq 0 ]
+
+  copy-docker:
+    needs: prepare
+    if: ${{ inputs.operation == 'copy_docker' }}
+    runs-on: ubuntu-24.04
+    env:
+      SRC_REPO: ${{ needs.prepare.outputs.src_repo }}
+      TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
+      IMAGE_MAPPINGS: ${{ inputs.image_mappings }}
+      SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
+      SKIP_EXISTING: ${{ inputs.docker_skip_existing }}
+      STRIP_V: ${{ inputs.strip_v_prefix }}
+      UPDATE_LATEST: ${{ inputs.update_latest }}
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SOURCE_USERNAME: ${{ secrets.SOURCE_REGISTRY_USERNAME }}
+      SOURCE_TOKEN: ${{ secrets.SOURCE_REGISTRY_TOKEN }}
+    steps:
+      - name: 安装 crane
+        run: |
+          set -euo pipefail
+          go install github.com/google/go-containerregistry/cmd/crane@v0.20.3
+          echo "${HOME}/go/bin" >> "${GITHUB_PATH}"
+      - name: 登录目标 GHCR
+        run: |
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" | "${HOME}/go/bin/crane" auth login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+      - name: 直接搬运一个或多个多架构镜像
+        shell: bash
+        run: |
+          set -euo pipefail
+          CRANE="${HOME}/go/bin/crane"; MAP="${RUNNER_TEMP}/maps"; : > "${MAP}"
+          if [ -z "${IMAGE_MAPPINGS}" ]; then printf '%s\t%s\n' "ghcr.io/${SRC_REPO,,}" "${TARGET_REPO#*/}" >> "${MAP}"; else
+            printf '%s' "${IMAGE_MAPPINGS}" | tr ';；' '\n\n' | sed '/^$/d' | while IFS= read -r m; do m="$(printf '%s' "${m}"|xargs)"; if [[ "${m}" == *"="* ]]; then s="${m%%=*}"; n="${m#*=}"; else s="${m}"; n="${s##*/}"; fi; s="${s,,}"; n="${n,,}"; [[ "${s}" != *"@"* ]] || { echo "::error::源镜像不能含 Digest"; exit 1; }; printf '%s\t%s\n' "${s}" "${n}" >> "${MAP}"; done
+          fi
+          sort -u "${MAP}" -o "${MAP}"; printf '%s' "${SELECTED_JSON}" > "${RUNNER_TEMP}/versions.json"
+          if [ -n "${SOURCE_USERNAME}" ] && [ -n "${SOURCE_TOKEN}" ]; then cut -f1 "${MAP}"|awk -F/ '{print $1}'|sort -u|while read -r r; do printf '%s' "${SOURCE_TOKEN}"|"${CRANE}" auth login "${r}" --username "${SOURCE_USERNAME}" --password-stdin; done; fi
+          OK=0; SKIP=0; MISS=0; FAIL=0
+          while IFS=$'\t' read -r src name; do
+            target="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${name}"; last=""
+            while IFS= read -r reltag; do st="${reltag}"; [ "${STRIP_V}" = true ] && st="${st#v}"; sref="${src}:${st}"; tref="${target}:${reltag}"
+              echo "${sref} -> ${tref}"
+              if ! "${CRANE}" manifest "${sref}" >/dev/null 2>&1; then echo "::warning::源镜像不存在：${sref}"; MISS=$((MISS+1)); continue; fi
+              if [ "${SKIP_EXISTING}" = true ] && "${CRANE}" manifest "${tref}" >/dev/null 2>&1; then echo "已存在，跳过"; SKIP=$((SKIP+1)); continue; fi
+              if "${CRANE}" copy "${sref}" "${tref}"; then echo "复制成功，摘要：$("${CRANE}" digest "${tref}")"; last="${sref}"; OK=$((OK+1)); else FAIL=$((FAIL+1)); fi
+            done < <(jq -r '.[].tagName' "${RUNNER_TEMP}/versions.json")
+            if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then "${CRANE}" copy "${last}" "${target}:latest" || FAIL=$((FAIL+1)); fi
+          done < "${MAP}"
+          echo "成功 ${OK}，跳过 ${SKIP}，源缺失 ${MISS}，失败 ${FAIL}"; [ "${FAIL}" -eq 0 ]

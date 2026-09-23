@@ -1,0 +1,69 @@
+DROP TABLE IF EXISTS `cloud_config`;
+CREATE TABLE `cloud_config` (
+  `key` varchar(32) NOT NULL,
+  `value` varchar(1000) DEFAULT NULL,
+  PRIMARY KEY (`key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+INSERT INTO `cloud_config` (`key`, `value`) VALUES
+('admin_username', 'admin'),
+('admin_password', '123456'),
+('bt_url', ''),
+('bt_key', ''),
+('whitelist', '0'),
+('download_page', '1'),
+('new_version', '13.0.0'),
+('update_msg', '暂无更新日志'),
+('update_date', '2026-08-13'),
+('new_version_win', '8.5.2'),
+('update_msg_win', '暂无更新日志'),
+('update_date_win', '2026-01-19'),
+('new_version_en', '7.0.25'),
+('update_msg_en', '暂无更新日志'),
+('update_date_en', '2025-09-10'),
+('new_version_btm', '2.3.3'),
+('update_msg_btm', '暂无更新日志'),
+('update_date_btm', '2025-08-12'),
+('updateall_type', '0'),
+('syskey', 'UqP94LtI8eWAIgCP');
+
+
+DROP TABLE IF EXISTS `cloud_black`;
+CREATE TABLE `cloud_black` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `ip` varchar(50) NOT NULL,
+  `enable` tinyint(1) NOT NULL DEFAULT '1',
+  `addtime` datetime NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `ip`(`ip`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+DROP TABLE IF EXISTS `cloud_white`;
+CREATE TABLE `cloud_white` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `ip` varchar(50) NOT NULL,
+  `enable` tinyint(1) NOT NULL DEFAULT '1',
+  `addtime` datetime NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `ip`(`ip`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+DROP TABLE IF EXISTS `cloud_record`;
+CREATE TABLE `cloud_record` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `ip` varchar(50) NOT NULL,
+  `addtime` datetime NOT NULL,
+  `usetime` datetime NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `ip`(`ip`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+DROP TABLE IF EXISTS `cloud_log`;
+CREATE TABLE `cloud_log` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `uid` tinyint(4) NOT NULL DEFAULT '1',
+  `action` varchar(40) NOT NULL,
+  `data` varchar(150) DEFAULT NULL,
+  `addtime` datetime NOT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
