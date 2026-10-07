@@ -1,31 +1,94 @@
-name: 一键同步 Tag、Release 与 Docker 镜像
-run-name: "${{ inputs.operation }} / ${{ inputs.copy_mode }} / ${{ inputs.tag }}"
+name: 一键同步 Tag、Release 与多个 Docker 镜像
+
+run-name: >-
+  多任务同步 | Tag=${{ inputs.tag_sync_mode }} | 版本=${{ inputs.copy_mode }} | ${{ inputs.tag }}
 
 on:
   workflow_dispatch:
     inputs:
-      operation:
-        description: "执行操作"
+      run_check_pat:
+        description: "检查 WORKFLOW_PAT"
+        required: true
+        type: boolean
+        default: false
+
+      run_sync_tags:
+        description: "同步 Tag/源码；源仓库为完整 Git URL 时搬运全部分支和 Tag"
+        required: true
+        type: boolean
+        default: false
+
+      tag_sync_mode:
+        description: "Tag 同步方式"
         required: true
         type: choice
-        default: copy_release
+        default: clean_snapshot
         options:
-          - check_pat
-          - sync_missing_tags
-          - copy_release
-          - copy_docker
+          - clean_snapshot
+          - original_tag
+
+      original_tag_protection:
+        description: "原始 Tag 使用 PAT 推送时的保护方式"
+        required: true
+        type: choice
+        default: permanently_disable_others
+        options:
+          - permanently_disable_others
+          - repository_variable_guard
+
+      guard_variable_name:
+        description: "变量保护模式使用的仓库变量名"
+        required: true
+        type: string
+        default: "DISABLE_UPSTREAM_WORKFLOWS"
+
+      restore_guard_variable:
+        description: "原始 Tag 推送后恢复保护变量原值"
+        required: true
+        type: boolean
+        default: true
+
+      clean_remove_paths:
+        description: "清理快照中删除的路径，空格分隔"
+        required: true
+        type: string
+        default: ".github/workflows"
+
+      run_copy_release:
+        description: "搬运或更新 Release，独立运行"
+        required: true
+        type: boolean
+        default: false
+
+      run_copy_docker:
+        description: "直接搬运一个或多个 Docker 多架构镜像"
+        required: true
+        type: boolean
+        default: false
+
       src_repo:
-        description: "源仓库 owner/repo，留空自动识别 Fork 上游"
+        description: "GitHub owner/repo、完整 Git URL；URL|mirror 严格镜像；Docker 独立填 none"
         required: false
         type: string
         default: ""
+
+      sync_scope:
+        description: "Tag 同步范围"
+        required: true
+        type: choice
+        default: all_missing
+        options:
+          - all_missing
+          - selected
+
       image_mappings:
-        description: "Docker 映射，多个用分号分隔；留空自动使用上游 GHCR"
+        description: "Docker 映射：留空自动扫描上游源码与 GitHub Packages；手动格式 源=目标|用户名|Token"
         required: false
         type: string
         default: ""
+
       copy_mode:
-        description: "版本选择方式"
+        description: "Release、Docker 和 selected Tag 的版本选择方式"
         required: true
         type: choice
         default: single
@@ -35,63 +98,79 @@ on:
           - all
           - date
           - range
+
       tag:
         description: "单个版本，例如 v1.6.3"
         required: false
         type: string
         default: ""
+
       tag_list:
-        description: "多个版本，使用逗号或空格分隔"
+        description: "多个版本，逗号、分号或空格分隔"
         required: false
         type: string
         default: ""
+
       start_date:
         description: "开始日期，例如 2026-01-01"
         required: false
         type: string
         default: ""
+
       end_date:
         description: "结束日期，例如 2026-12-31"
         required: false
         type: string
         default: ""
+
       from_tag:
         description: "起始版本，例如 v1.0.0"
         required: false
         type: string
         default: ""
+
       to_tag:
         description: "结束版本，例如 v1.6.3"
         required: false
         type: string
         default: ""
-      overwrite_assets:
-        description: "覆盖同名 Release 附件"
+
+      release_update_mode:
+        description: "Release 更新方式：完整覆盖、保留已有附件、仅更新版本信息"
         required: true
-        type: boolean
-        default: true
+        type: choice
+        default: keep_existing_assets
+        options:
+          - overwrite_all_assets
+          - keep_existing_assets
+          - metadata_only
+
       include_drafts:
         description: "包含草稿 Release"
         required: true
         type: boolean
         default: false
+
       include_prereleases:
-        description: "包含预发布版本"
+        description: "包含预发布 Release"
         required: true
         type: boolean
         default: true
+
       docker_skip_existing:
         description: "目标 Docker 镜像版本已存在时跳过"
         required: true
         type: boolean
         default: true
+
       strip_v_prefix:
-        description: "读取源 Docker Tag 时去掉开头 v"
+        description: "读取源 Docker Tag 时去掉版本开头的 v"
         required: true
         type: boolean
         default: false
+
       update_latest:
-        description: "每个镜像将最后一个成功版本同时更新为 latest"
+        description: "每个 Docker 镜像将最后成功版本更新为 latest"
         required: true
         type: boolean
         default: false
@@ -99,21 +178,27 @@ on:
 permissions:
   contents: write
   packages: write
+  actions: write
 
 concurrency:
-  group: all-in-one-sync-${{ github.repository }}
+  group: complete-mirror-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
   prepare:
+    name: 准备仓库与筛选版本
     runs-on: ubuntu-24.04
     outputs:
-      src_repo: ${{ steps.repo.outputs.src_repo }}
-      target_repo: ${{ steps.repo.outputs.target_repo }}
-      selected_json: ${{ steps.select.outputs.selected_json }}
-      selected_count: ${{ steps.select.outputs.selected_count }}
+      src_repo: ${{ steps.repository.outputs.src_repo }}
+      target_repo: ${{ steps.repository.outputs.target_repo }}
+      source_kind: ${{ steps.repository.outputs.source_kind }}
+      external_git_mode: ${{ steps.repository.outputs.external_git_mode }}
+      selected_json: ${{ steps.final.outputs.selected_json }}
+      selected_count: ${{ steps.final.outputs.selected_count }}
+      docker_versions_json: ${{ steps.docker_order.outputs.docker_versions_json }}
+      docker_versions_count: ${{ steps.docker_order.outputs.docker_versions_count }}
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
       INPUT_SRC_REPO: ${{ inputs.src_repo }}
       TARGET_REPO: ${{ github.repository }}
       COPY_MODE: ${{ inputs.copy_mode }}
@@ -123,148 +208,801 @@ jobs:
       END_DATE: ${{ inputs.end_date }}
       FROM_TAG: ${{ inputs.from_tag }}
       TO_TAG: ${{ inputs.to_tag }}
-      INCLUDE_DRAFTS: ${{ inputs.include_drafts }}
-      INCLUDE_PRERELEASES: ${{ inputs.include_prereleases }}
+      IMAGE_MAPPINGS: ${{ inputs.image_mappings }}
     steps:
-      - name: 自动识别源仓库
-        id: repo
+      - name: 验证任务选择
         shell: bash
         run: |
           set -euo pipefail
-          if [ -n "${INPUT_SRC_REPO}" ]; then
-            SRC_REPO="${INPUT_SRC_REPO}"
-          else
-            INFO="$(gh api "repos/${TARGET_REPO}")"
-            SRC_REPO="$(jq -r '.parent.full_name // .full_name' <<< "${INFO}")"
+          if [ "${{ inputs.run_check_pat }}" != "true" ] && \
+             [ "${{ inputs.run_sync_tags }}" != "true" ] && \
+             [ "${{ inputs.run_copy_release }}" != "true" ] && \
+             [ "${{ inputs.run_copy_docker }}" != "true" ]; then
+            echo "::error::请至少勾选一个任务"
+            exit 1
           fi
-          printf '%s' "${SRC_REPO}" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || { echo "::error::源仓库格式错误"; exit 1; }
-          echo "源仓库：${SRC_REPO}"
-          echo "目标仓库：${TARGET_REPO}"
-          echo "src_repo=${SRC_REPO}" >> "${GITHUB_OUTPUT}"
-          echo "target_repo=${TARGET_REPO}" >> "${GITHUB_OUTPUT}"
 
-      - name: 选择 Release 版本
-        id: select
-        if: ${{ inputs.operation == 'copy_release' || inputs.operation == 'copy_docker' }}
+          echo "检查 PAT：${{ inputs.run_check_pat }}"
+          echo "同步 Tag：${{ inputs.run_sync_tags }}"
+          echo "Tag 同步方式：${{ inputs.tag_sync_mode }}"
+          echo "搬运 Release：${{ inputs.run_copy_release }}"
+          echo "搬运 Docker：${{ inputs.run_copy_docker }}"
+
+          if [[ "${INPUT_SRC_REPO}" =~ ^(https?://|ssh://|git://|git@) ]]; then
+            [ "${{ inputs.run_sync_tags }}" = "true" ] || { echo "::error::完整 Git URL 模式必须勾选同步 Tag/源码"; exit 1; }
+            [ "${{ inputs.run_copy_release }}" != "true" ] || { echo "::error::外部 Git URL 模式不支持搬运 GitHub Release"; exit 1; }
+            [ "${{ inputs.run_copy_docker }}" != "true" ] || { echo "::error::外部 Git URL 模式请单独运行，不能同时搬运 Docker"; exit 1; }
+          fi
+
+          if [ "${INPUT_SRC_REPO,,}" = "none" ]; then
+            [ "${{ inputs.run_copy_docker }}" = "true" ] || { echo "::error::src_repo=none 仅支持单独 Docker 搬运"; exit 1; }
+            [ "${{ inputs.run_sync_tags }}" != "true" ] || { echo "::error::src_repo=none 不能同步 Git Tag"; exit 1; }
+            [ "${{ inputs.run_copy_release }}" != "true" ] || { echo "::error::src_repo=none 不能搬运 Release"; exit 1; }
+            case "${COPY_MODE}" in
+              single|multiple) ;;
+              *) echo "::error::src_repo=none 仅支持 single 或 multiple 精准 Docker Tag；all/date/range 需要 GitHub Release 仓库"; exit 1 ;;
+            esac
+          fi
+
+      - name: 自动识别源仓库
+        id: repository
         shell: bash
-        env:
-          SRC_REPO: ${{ steps.repo.outputs.src_repo }}
         run: |
           set -euo pipefail
-          ALL="${RUNNER_TEMP}/all.json"; OUT="${RUNNER_TEMP}/selected.json"
-          gh release list -R "${SRC_REPO}" --limit 1000 --order asc --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease > "${ALL}"
-          [ "$(jq length "${ALL}")" -gt 0 ] || { echo "::error::源仓库没有 Release"; exit 1; }
+          EXTERNAL_GIT_MODE="safe"
+          RAW_SRC_REPO="${INPUT_SRC_REPO}"
+          if [[ "${RAW_SRC_REPO,,}" == *"|mirror" ]]; then
+            EXTERNAL_GIT_MODE="mirror"
+            INPUT_SRC_REPO="${RAW_SRC_REPO%|*}"
+            INPUT_SRC_REPO="$(printf '%s' "${INPUT_SRC_REPO}" | xargs)"
+            [ -n "${INPUT_SRC_REPO}" ] || { echo "::error::|mirror 前缺少 Git 仓库地址"; exit 1; }
+          elif [[ "${RAW_SRC_REPO}" == *"|"* ]]; then
+            echo "::error::外部 Git 地址后缀无效，仅支持 |mirror"
+            exit 1
+          fi
+
+          if [ "${INPUT_SRC_REPO,,}" = "none" ]; then
+            SOURCE_REPO="none"
+            SOURCE_KIND="docker_none"
+            SOURCE_TYPE="Docker 独立精准版本模式，跳过 GitHub 源仓库"
+          elif [[ "${INPUT_SRC_REPO}" =~ ^(https?://|ssh://|git://|git@) ]]; then
+            SOURCE_REPO="${INPUT_SRC_REPO}"
+            SOURCE_KIND="external_git"
+            SOURCE_TYPE="外部标准 Git 仓库 URL，模式=${EXTERNAL_GIT_MODE}"
+            if [[ "${SOURCE_REPO}" =~ ^https?://[^/]*@ ]]; then
+              echo "::error::禁止在 Git URL 中直接携带用户名或 Token"
+              exit 1
+            fi
+            git ls-remote "${SOURCE_REPO}" HEAD >/dev/null || { echo "::error::外部 Git 仓库无法访问：${SOURCE_REPO}"; exit 1; }
+          elif [ -n "${INPUT_SRC_REPO}" ]; then
+            SOURCE_REPO="${INPUT_SRC_REPO}"
+            SOURCE_KIND="github"
+            SOURCE_TYPE="手动指定 GitHub 仓库"
+          else
+            REPOSITORY_JSON="$(gh api "repos/${TARGET_REPO}")"
+            SOURCE_REPO="$(jq -r '.parent.full_name // .full_name' <<< "${REPOSITORY_JSON}")"
+            SOURCE_KIND="github"
+            if [ "${SOURCE_REPO}" = "${TARGET_REPO}" ]; then SOURCE_TYPE="当前仓库不是 Fork"; else SOURCE_TYPE="自动识别 Fork 上游"; fi
+          fi
+
+          if [ "${SOURCE_KIND}" = "github" ] && ! printf '%s' "${SOURCE_REPO}" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
+            echo "::error::源仓库格式错误：${SOURCE_REPO}"
+            exit 1
+          fi
+
+          echo "识别方式：${SOURCE_TYPE}"
+          echo "源仓库：${SOURCE_REPO}"
+          echo "目标仓库：${TARGET_REPO}"
+          echo "src_repo=${SOURCE_REPO}" >> "${GITHUB_OUTPUT}"
+          echo "target_repo=${TARGET_REPO}" >> "${GITHUB_OUTPUT}"
+          echo "source_kind=${SOURCE_KIND}" >> "${GITHUB_OUTPUT}"
+          echo "external_git_mode=${EXTERNAL_GIT_MODE}" >> "${GITHUB_OUTPUT}"
+
+      - name: 检查运行环境和仓库访问
+        env:
+          SOURCE_REPO: ${{ steps.repository.outputs.src_repo }}
+        run: |
+          set -euo pipefail
+          gh --version
+          git --version
+          jq --version
+          curl --version
+          if [ "${{ steps.repository.outputs.source_kind }}" = "github" ]; then gh repo view "${SOURCE_REPO}" >/dev/null; fi
+          gh repo view "${TARGET_REPO}" >/dev/null
+
+      - name: 获取并筛选 Release 版本
+        id: select
+        if: ${{ steps.repository.outputs.source_kind == 'github' && (inputs.run_copy_release || inputs.run_copy_docker || (inputs.run_sync_tags && inputs.sync_scope == 'selected')) }}
+        env:
+          SOURCE_REPO: ${{ steps.repository.outputs.src_repo }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ALL="${RUNNER_TEMP}/all-releases.json"
+          OUT="${RUNNER_TEMP}/selected-releases.json"
+          REQUESTED="${RUNNER_TEMP}/requested-tags.txt"
+
+          gh release list --repo "${SOURCE_REPO}" --limit 1000 --order asc \
+            --json tagName,name,publishedAt,createdAt,isDraft,isPrerelease |
+            jq 'sort_by([(.publishedAt // .createdAt), .tagName])' > "${ALL}"
+
+          TOTAL="$(jq length "${ALL}")"
+          [ "${TOTAL}" -gt 0 ] || { echo "::error::源仓库没有 Release"; exit 1; }
+
           case "${COPY_MODE}" in
             single)
-              [ -n "${SINGLE_TAG}" ] || { echo "::error::必须填写 tag"; exit 1; }
-              jq --arg t "${SINGLE_TAG}" '[.[]|select(.tagName==$t)]' "${ALL}" > "${OUT}" ;;
+              [ -n "${SINGLE_TAG}" ] || { echo "::error::single 模式必须填写 tag"; exit 1; }
+              jq --arg tag "${SINGLE_TAG}" '[.[]|select(.tagName==$tag)]' "${ALL}" > "${OUT}"
+              ;;
             multiple)
-              [ -n "${TAG_LIST}" ] || { echo "::error::必须填写 tag_list"; exit 1; }
-              L="${RUNNER_TEMP}/list"; printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^$/d' | sort -u > "${L}"
-              jq --rawfile x "${L}" '($x|split("\n")|map(select(length>0))) as $w|[.[]|select(.tagName as $t|$w|index($t))]' "${ALL}" > "${OUT}"
-              F="${RUNNER_TEMP}/found"; M="${RUNNER_TEMP}/missing"; jq -r '.[].tagName' "${OUT}" | sort -u > "${F}"; comm -23 "${L}" "${F}" > "${M}"
-              [ ! -s "${M}" ] || { echo "::error::不存在的版本："; cat "${M}"; exit 1; } ;;
-            all) cp "${ALL}" "${OUT}" ;;
+              [ -n "${TAG_LIST}" ] || { echo "::error::multiple 模式必须填写 tag_list"; exit 1; }
+              printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^$/d' | sort -u > "${REQUESTED}"
+              jq --rawfile tags "${REQUESTED}" '($tags|split("\n")|map(select(length>0))) as $wanted|[.[]|select(.tagName as $tag|$wanted|index($tag))]' "${ALL}" > "${OUT}"
+              FOUND="${RUNNER_TEMP}/found-tags.txt"
+              MISSING="${RUNNER_TEMP}/missing-tags.txt"
+              jq -r '.[].tagName' "${OUT}" | sort -u > "${FOUND}"
+              comm -23 "${REQUESTED}" "${FOUND}" > "${MISSING}"
+              [ ! -s "${MISSING}" ] || { echo "::error::以下版本不存在："; cat "${MISSING}"; exit 1; }
+              ;;
+            all)
+              cp "${ALL}" "${OUT}"
+              ;;
             date)
-              [ -n "${START_DATE}" ] && [ -n "${END_DATE}" ] || { echo "::error::必须填写日期"; exit 1; }
-              date -d "${START_DATE}" >/dev/null; date -d "${END_DATE}" >/dev/null
-              S="$(date -u -d "${START_DATE} 00:00:00" +%Y-%m-%dT%H:%M:%SZ)"; E="$(date -u -d "${END_DATE} 23:59:59" +%Y-%m-%dT%H:%M:%SZ)"
-              [[ "${S}" < "${E}" || "${S}" == "${E}" ]] || { echo "::error::日期顺序错误"; exit 1; }
-              jq --arg s "${S}" --arg e "${E}" '[.[]|select((.publishedAt//.createdAt)>=$s and (.publishedAt//.createdAt)<=$e)]' "${ALL}" > "${OUT}" ;;
+              [ -n "${START_DATE}" ] && [ -n "${END_DATE}" ] || { echo "::error::date 模式必须填写日期"; exit 1; }
+              date -d "${START_DATE}" >/dev/null 2>&1 || { echo "::error::开始日期无效"; exit 1; }
+              date -d "${END_DATE}" >/dev/null 2>&1 || { echo "::error::结束日期无效"; exit 1; }
+              START_TS="$(date -u -d "${START_DATE} 00:00:00" +%Y-%m-%dT%H:%M:%SZ)"
+              END_TS="$(date -u -d "${END_DATE} 23:59:59" +%Y-%m-%dT%H:%M:%SZ)"
+              [[ "${START_TS}" < "${END_TS}" || "${START_TS}" == "${END_TS}" ]] || { echo "::error::日期顺序错误"; exit 1; }
+              jq --arg start "${START_TS}" --arg end "${END_TS}" '[.[]|select((.publishedAt//.createdAt)>=$start and (.publishedAt//.createdAt)<=$end)]' "${ALL}" > "${OUT}"
+              ;;
             range)
-              [ -n "${FROM_TAG}" ] && [ -n "${TO_TAG}" ] || { echo "::error::必须填写起止版本"; exit 1; }
-              A="$(jq --arg t "${FROM_TAG}" 'map(.tagName)|index($t)' "${ALL}")"; B="$(jq --arg t "${TO_TAG}" 'map(.tagName)|index($t)' "${ALL}")"
-              [ "${A}" != null ] && [ "${B}" != null ] || { echo "::error::起止版本不存在"; exit 1; }
-              if [ "${A}" -gt "${B}" ]; then T="${A}"; A="${B}"; B="${T}"; fi
-              jq --argjson a "${A}" --argjson b "${B}" '.[$a:($b+1)]' "${ALL}" > "${OUT}" ;;
-            *) echo "::error::未知模式"; exit 1 ;;
+              [ -n "${FROM_TAG}" ] && [ -n "${TO_TAG}" ] || { echo "::error::range 模式必须填写起止版本"; exit 1; }
+              FROM_INDEX="$(jq --arg tag "${FROM_TAG}" 'map(.tagName)|index($tag)' "${ALL}")"
+              TO_INDEX="$(jq --arg tag "${TO_TAG}" 'map(.tagName)|index($tag)' "${ALL}")"
+              [ "${FROM_INDEX}" != null ] && [ "${TO_INDEX}" != null ] || { echo "::error::起止版本不存在"; exit 1; }
+              if [ "${FROM_INDEX}" -gt "${TO_INDEX}" ]; then TEMP="${FROM_INDEX}";FROM_INDEX="${TO_INDEX}";TO_INDEX="${TEMP}"; fi
+              jq --argjson start "${FROM_INDEX}" --argjson end "${TO_INDEX}" '.[$start:($end+1)]' "${ALL}" > "${OUT}"
+              ;;
+            *)
+              echo "::error::未知筛选模式：${COPY_MODE}"
+              exit 1
+              ;;
           esac
-          if [ "${INCLUDE_DRAFTS}" != true ]; then jq '[.[]|select(.isDraft==false)]' "${OUT}" > "${OUT}.x"; mv "${OUT}.x" "${OUT}"; fi
-          if [ "${INCLUDE_PRERELEASES}" != true ]; then jq '[.[]|select(.isPrerelease==false)]' "${OUT}" > "${OUT}.x"; mv "${OUT}.x" "${OUT}"; fi
-          C="$(jq length "${OUT}")"; [ "${C}" -gt 0 ] || { echo "::error::没有选中版本"; exit 1; }
+
+          if [ "${{ inputs.include_drafts }}" != true ]; then
+            jq '[.[]|select(.isDraft==false)]' "${OUT}" > "${OUT}.tmp"
+            mv "${OUT}.tmp" "${OUT}"
+          fi
+
+          if [ "${{ inputs.include_prereleases }}" != true ]; then
+            jq '[.[]|select(.isPrerelease==false)]' "${OUT}" > "${OUT}.tmp"
+            mv "${OUT}.tmp" "${OUT}"
+          fi
+
+          jq 'sort_by([(.publishedAt // .createdAt), .tagName])' "${OUT}" > "${OUT}.tmp"
+          mv "${OUT}.tmp" "${OUT}"
+
+          COUNT="$(jq length "${OUT}")"
+          [ "${COUNT}" -gt 0 ] || { echo "::error::没有选中版本"; exit 1; }
           jq -r '.[]|"版本：\(.tagName) | 日期：\(.publishedAt//.createdAt)"' "${OUT}"
-          echo "selected_json=$(jq -c . "${OUT}")" >> "${GITHUB_OUTPUT}"; echo "selected_count=${C}" >> "${GITHUB_OUTPUT}"
+          echo "selected_json=$(jq -c . "${OUT}")" >> "${GITHUB_OUTPUT}"
+          echo "selected_count=${COUNT}" >> "${GITHUB_OUTPUT}"
+
+      - name: Docker 独立模式生成精准版本
+        id: docker_direct
+        if: ${{ steps.repository.outputs.src_repo == 'none' && inputs.run_copy_docker }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="${RUNNER_TEMP}/docker-direct-versions.json"
+          REQUESTED="${RUNNER_TEMP}/docker-direct-tags.txt"
+          :>"${REQUESTED}"
+          EMBEDDED_TOTAL=0
+          MAPPING_TOTAL=0
+          if [ -n "${IMAGE_MAPPINGS}" ]; then
+            while IFS= read -r item; do
+              item="$(printf '%s' "${item}" | xargs)"; [ -n "${item}" ] || continue
+              mapping="${item%%|*}"
+              if [[ "${mapping}" == *"="* ]]; then src="${mapping%%=*}"; else src="${mapping}"; fi
+              src="$(printf '%s' "${src}" | xargs)"
+              MAPPING_TOTAL=$((MAPPING_TOTAL+1))
+              last="${src##*/}"
+              if [[ "${last}" == *:* ]]; then EMBEDDED_TOTAL=$((EMBEDDED_TOTAL+1)); fi
+            done < <(printf '%s\n' "${IMAGE_MAPPINGS}" | sed 's/；/;/g; s/;/\n/g' | sed '/^[[:space:]]*$/d')
+          fi
+          case "${COPY_MODE}" in
+            single)
+              if [ -n "${SINGLE_TAG}" ]; then
+                printf '%s\n' "${SINGLE_TAG}" > "${REQUESTED}"
+              elif [ -n "${TAG_LIST}" ]; then
+                echo "single 未填写 tag，但 tag_list 有内容，自动按多个公共 Tag 处理。"
+                printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | sort -u > "${REQUESTED}"
+              elif [ "${MAPPING_TOTAL}" -gt 0 ] && [ "${EMBEDDED_TOTAL}" -eq "${MAPPING_TOTAL}" ]; then
+                printf '%s\n' '__mapping_tag__' > "${REQUESTED}"
+                echo "所有 Docker 映射均自带独立 Tag，公共 tag/tag_list 允许为空。"
+              else
+                echo "::error::none + single 必须填写 tag，或者确保每个 Docker 源地址都自带 Tag"; exit 1
+              fi;;
+            multiple)
+              if [ -n "${TAG_LIST}" ]; then
+                printf '%s\n' "${TAG_LIST}" | sed 's/[，；,;]/\n/g' | tr ' ' '\n' | sed '/^[[:space:]]*$/d' | sort -u > "${REQUESTED}"
+              elif [ -n "${SINGLE_TAG}" ]; then
+                printf '%s\n' "${SINGLE_TAG}" > "${REQUESTED}"
+                echo "multiple 未填写 tag_list，但 tag 有内容，自动按单个公共 Tag 处理。"
+              elif [ "${MAPPING_TOTAL}" -gt 0 ] && [ "${EMBEDDED_TOTAL}" -eq "${MAPPING_TOTAL}" ]; then
+                printf '%s\n' '__mapping_tag__' > "${REQUESTED}"
+                echo "所有 Docker 映射均自带独立 Tag，公共 tag/tag_list 允许为空。"
+              else
+                echo "::error::none + multiple 必须填写 tag_list，或者确保每个 Docker 源地址都自带 Tag"; exit 1
+              fi;;
+            *) echo "::error::none 模式仅支持 single 或 multiple"; exit 1;;
+          esac
+          [ -s "${REQUESTED}" ] || { echo "::error::没有有效的 Docker Tag"; exit 1; }
+          jq -R -s 'split("\n") | map(select(length>0)) | map({tagName:.,name:.,publishedAt:null,createdAt:null,isDraft:false,isPrerelease:false})' "${REQUESTED}" > "${OUT}"
+          COUNT="$(jq length "${OUT}")"
+          echo "Docker 独立精准版本："
+          jq -r '.[].tagName' "${OUT}" | nl -ba
+          echo "selected_json=$(jq -c . "${OUT}")" >> "${GITHUB_OUTPUT}"
+          echo "selected_count=${COUNT}" >> "${GITHUB_OUTPUT}"
+
+      - name: 设置输出
+        id: final
+        env:
+          RELEASE_JSON: ${{ steps.select.outputs.selected_json }}
+          RELEASE_COUNT: ${{ steps.select.outputs.selected_count }}
+          DIRECT_JSON: ${{ steps.docker_direct.outputs.selected_json }}
+          DIRECT_COUNT: ${{ steps.docker_direct.outputs.selected_count }}
+        run: |
+          JSON="${DIRECT_JSON:-${RELEASE_JSON:-[]}}"
+          COUNT="${DIRECT_COUNT:-${RELEASE_COUNT:-0}}"
+          echo "selected_json=${JSON}" >> "${GITHUB_OUTPUT}"
+          echo "selected_count=${COUNT}" >> "${GITHUB_OUTPUT}"
+
+      - name: 为 Docker 生成与 clean_snapshot 一致的有序版本清单
+        id: docker_order
+        if: ${{ inputs.run_copy_docker }}
+        env:
+          SELECTED_JSON: ${{ steps.final.outputs.selected_json }}
+          TAG_SYNC_MODE: ${{ inputs.tag_sync_mode }}
+          SOURCE_KIND: ${{ steps.repository.outputs.source_kind }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          INPUT_FILE="${RUNNER_TEMP}/docker-versions-input.json"
+          OUTPUT_FILE="${RUNNER_TEMP}/docker-versions-ordered.json"
+          ORDER_FILE="${RUNNER_TEMP}/docker-versions-order.txt"
+          printf '%s' "${SELECTED_JSON}" > "${INPUT_FILE}"
+          jq -e 'type=="array" and length>0' "${INPUT_FILE}" >/dev/null || { echo "::error::没有可供 Docker 使用的版本"; exit 1; }
+          if [ "${SOURCE_KIND}" = "github" ] && [ "${TAG_SYNC_MODE}" = "clean_snapshot" ]; then
+            jq -r '.[].tagName' "${INPUT_FILE}" | sort -V > "${ORDER_FILE}"
+            jq --rawfile tags "${ORDER_FILE}" '($tags|split("\n")|map(select(length>0))|to_entries|map({key:.value,value:.key})|from_entries) as $order | sort_by($order[.tagName])' "${INPUT_FILE}" > "${OUTPUT_FILE}"
+            echo "clean_snapshot 已作用于 Docker：按自然版本号从旧到新排序。"
+          else
+            jq '.' "${INPUT_FILE}" > "${OUTPUT_FILE}"
+            echo "Docker 保持原版本选择顺序。"
+          fi
+          echo "Docker 最终处理顺序："
+          jq -r '.[].tagName' "${OUTPUT_FILE}" | nl -ba
+          echo "docker_versions_json=$(jq -c . "${OUTPUT_FILE}")" >> "${GITHUB_OUTPUT}"
+          echo "docker_versions_count=$(jq length "${OUTPUT_FILE}")" >> "${GITHUB_OUTPUT}"
+
+  mirror-external-git:
+    name: 搬运外部 Git 全部分支和 Tag
+    needs: prepare
+    if: ${{ inputs.run_sync_tags && needs.prepare.outputs.source_kind == 'external_git' }}
+    runs-on: ubuntu-24.04
+    env:
+      SOURCE_GIT_URL: ${{ needs.prepare.outputs.src_repo }}
+      EXTERNAL_GIT_MODE: ${{ needs.prepare.outputs.external_git_mode }}
+      TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
+      PUSH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+    steps:
+      - name: 裸克隆并推送全部分支和 Tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${PUSH_TOKEN}" ] || { echo "::error::缺少可写入目标仓库的 Token"; exit 1; }
+          echo "::add-mask::${PUSH_TOKEN}"
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "${WORK}"' EXIT
+          BARE_REPO="${WORK}/source.git"
+          TARGET_URL="https://x-access-token:${PUSH_TOKEN}@github.com/${TARGET_REPO}.git"
+
+          echo "外部源仓库：${SOURCE_GIT_URL}"
+          echo "GitHub 目标仓库：${TARGET_REPO}"
+          echo "同步模式：${EXTERNAL_GIT_MODE}"
+
+          if [ "${EXTERNAL_GIT_MODE}" = "mirror" ]; then
+            echo "::warning::严格 mirror 会让目标 Git 引用与源仓库一致，并删除目标中源端不存在的引用。"
+            git clone --mirror "${SOURCE_GIT_URL}" "${BARE_REPO}"
+          else
+            git clone --bare "${SOURCE_GIT_URL}" "${BARE_REPO}"
+          fi
+
+          BRANCH_COUNT="$(git -C "${BARE_REPO}" for-each-ref --format='%(refname)' refs/heads | wc -l | xargs)"
+          TAG_COUNT="$(git -C "${BARE_REPO}" for-each-ref --format='%(refname)' refs/tags | wc -l | xargs)"
+          [ "${BRANCH_COUNT}" -gt 0 ] || { echo "::error::源仓库没有可推送的分支"; exit 1; }
+          echo "检测到分支：${BRANCH_COUNT}；Tag：${TAG_COUNT}"
+          git -C "${BARE_REPO}" for-each-ref --format='分支：%(refname:strip=2)' refs/heads
+          git -C "${BARE_REPO}" for-each-ref --format='Tag：%(refname:strip=2)' refs/tags
+
+          if [ "${EXTERNAL_GIT_MODE}" = "mirror" ]; then
+            # 严格镜像全部可推送引用，并删除目标中源端不存在的引用。
+            # 排除 GitHub 禁止更新的 refs/pull，避免外部平台同名内部引用导致失败。
+            git -C "${BARE_REPO}" for-each-ref --format='%(refname)' refs/pull | while IFS= read -r ref; do
+              [ -n "${ref}" ] && git -C "${BARE_REPO}" update-ref -d "${ref}"
+            done
+            git -C "${BARE_REPO}" push --mirror "${TARGET_URL}"
+            echo "外部 Git 严格镜像完成：分支 ${BRANCH_COUNT} 个，Tag ${TAG_COUNT} 个。"
+          else
+            # 安全模式只同步 heads 和 tags，不删除目标额外引用。
+            git -C "${BARE_REPO}" push --force "${TARGET_URL}" 'refs/heads/*:refs/heads/*'
+            if [ "${TAG_COUNT}" -gt 0 ]; then
+              git -C "${BARE_REPO}" push --force "${TARGET_URL}" 'refs/tags/*:refs/tags/*'
+            fi
+            echo "外部 Git 安全同步完成：分支 ${BRANCH_COUNT} 个，Tag ${TAG_COUNT} 个。"
+          fi
 
   check-pat:
+    name: 检查 WORKFLOW_PAT
     needs: prepare
-    if: ${{ inputs.operation == 'check_pat' || inputs.operation == 'sync_missing_tags' }}
+    if: ${{ needs.prepare.outputs.source_kind != 'external_git' && (inputs.run_check_pat || (inputs.run_sync_tags && inputs.tag_sync_mode == 'original_tag')) }}
     runs-on: ubuntu-24.04
     env:
       TOKEN: ${{ secrets.WORKFLOW_PAT }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
     steps:
-      - name: 检查 WORKFLOW_PAT
+      - name: 验证 PAT 身份、scope 和写入权限
         shell: bash
         run: |
           set -euo pipefail
           [ -n "${TOKEN:-}" ] || { echo "::error::没有配置 WORKFLOW_PAT"; exit 1; }
-          CODE="$(curl -sS -o "${RUNNER_TEMP}/repo.json" -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${TARGET_REPO}")"
-          [ "${CODE}" = 200 ] || { echo "::error::PAT 无效或无法访问仓库，HTTP ${CODE}"; exit 1; }
-          [ "$(jq -r '.permissions.push//false' "${RUNNER_TEMP}/repo.json")" = true ] || { echo "::error::PAT 没有写权限"; exit 1; }
-          echo "WORKFLOW_PAT 检查通过"
+          USER_FILE="${RUNNER_TEMP}/pat-user.json"
+          HEADER_FILE="${RUNNER_TEMP}/pat-headers.txt"
+          STATUS="$(curl -sS --dump-header "${HEADER_FILE}" --output "${USER_FILE}" --write-out '%{http_code}' -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' https://api.github.com/user)"
+          [ "${STATUS}" = 200 ] || { echo "::error::PAT 无效，HTTP ${STATUS}"; exit 1; }
+          echo "PAT 账号：$(jq -r '.login//"未知"' "${USER_FILE}")"
+          SCOPES="$(grep -i '^x-oauth-scopes:' "${HEADER_FILE}"|cut -d: -f2-|tr -d '\r'|xargs || true)"
+          [ -z "${SCOPES}" ] || echo "PAT 权限：${SCOPES}"
+          REPO_FILE="${RUNNER_TEMP}/pat-repo.json"
+          STATUS="$(curl -sS --output "${REPO_FILE}" --write-out '%{http_code}' -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${TARGET_REPO}")"
+          [ "${STATUS}" = 200 ] || { echo "::error::PAT 无法访问目标仓库，HTTP ${STATUS}"; exit 1; }
+          [ "$(jq -r '.permissions.push//false' "${REPO_FILE}")" = true ] || { echo "::error::PAT 没有写入权限"; exit 1; }
+          echo "WORKFLOW_PAT 检查通过。"
 
-  sync-tags:
+  sync-original-tags:
+    name: 原样同步 Tag 和原始提交
     needs: [prepare, check-pat]
-    if: ${{ inputs.operation == 'sync_missing_tags' }}
+    if: ${{ inputs.run_sync_tags && needs.prepare.outputs.source_kind == 'github' && inputs.tag_sync_mode == 'original_tag' }}
     runs-on: ubuntu-24.04
     env:
       TOKEN: ${{ secrets.WORKFLOW_PAT }}
-      SRC_REPO: ${{ needs.prepare.outputs.src_repo }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT }}
+      SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
+      SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
+      PROTECTION: ${{ inputs.original_tag_protection }}
+      GUARD_NAME: ${{ inputs.guard_variable_name }}
     steps:
-      - name: 只同步缺少的 Tag 和源码对象
+      - name: 选择并启用 PAT 保护方案
         shell: bash
         run: |
           set -euo pipefail
-          [ "${SRC_REPO}" != "${TARGET_REPO}" ] || { echo "源和目标相同"; exit 0; }
-          W="$(mktemp -d)"; trap 'rm -rf "${W}"' EXIT; S="https://github.com/${SRC_REPO}.git"; T="https://x-access-token:${TOKEN}@github.com/${TARGET_REPO}.git"
-          git -C "${W}" init -q; git -C "${W}" remote add upstream "${S}"
-          git ls-remote --tags --refs "${S}" | awk '{sub("refs/tags/","",$2);print $2}' | sort -u > "${W}/s"
-          git ls-remote --tags --refs "${T}" | awk '{sub("refs/tags/","",$2);print $2}' | sort -u > "${W}/t"
-          comm -23 "${W}/s" "${W}/t" > "${W}/m"; OK=0; FAIL=0
-          while IFS= read -r tag; do [ -n "${tag}" ] || continue; if git -C "${W}" fetch --force upstream "refs/tags/${tag}:refs/tags/${tag}" && git -C "${W}" push "${T}" "refs/tags/${tag}:refs/tags/${tag}"; then OK=$((OK+1)); else FAIL=$((FAIL+1)); fi; done < "${W}/m"
-          echo "成功 ${OK}，失败 ${FAIL}。已有 Tag 未覆盖、未修改、未删除。"; [ "${FAIL}" -eq 0 ]
+          case "${PROTECTION}" in
+            permanently_disable_others)
+              CURRENT_INFO="${RUNNER_TEMP}/current-run.json"
+              curl -fsSL -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' \
+                "https://api.github.com/repos/${TARGET_REPO}/actions/runs/${GITHUB_RUN_ID}" > "${CURRENT_INFO}"
+              CURRENT_WORKFLOW_ID="$(jq -r '.workflow_id' "${CURRENT_INFO}")"
+              echo "${CURRENT_WORKFLOW_ID}" > "${RUNNER_TEMP}/current-workflow-id.txt"
+              PAGE=1
+              while :; do
+                RESPONSE="$(curl -fsSL -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${TARGET_REPO}/actions/workflows?per_page=100&page=${PAGE}")"
+                COUNT="$(jq '.workflows|length' <<< "${RESPONSE}")"
+                [ "${COUNT}" -gt 0 ] || break
+                while IFS=$'\t' read -r id name path state; do
+                  [ -n "${id}" ] || continue
+                  [ "${id}" = "${CURRENT_WORKFLOW_ID}" ] && { echo "保留当前：${name}"; continue; }
+                  HTTP="$(curl -sS -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${TARGET_REPO}/actions/workflows/${id}/disable")"
+                  [ "${HTTP}" = 204 ] || { echo "::error::禁用失败：${name}，HTTP ${HTTP}"; exit 1; }
+                  echo "已永久禁用：${name} (${path})"
+                done < <(jq -r '.workflows[]|[.id,.name,.path,.state]|@tsv' <<< "${RESPONSE}")
+                [ "${COUNT}" -lt 100 ] && break
+                PAGE=$((PAGE+1))
+              done
+              ;;
+            repository_variable_guard)
+              STATUS="$(curl -sS -o "${RUNNER_TEMP}/guard.json" -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${TARGET_REPO}/actions/variables/${GUARD_NAME}")"
+              if [ "${STATUS}" = 200 ]; then
+                echo "exists" > "${RUNNER_TEMP}/guard-state"
+                jq -r '.value' "${RUNNER_TEMP}/guard.json" > "${RUNNER_TEMP}/guard-old"
+                HTTP="$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' "https://api.github.com/repos/${TARGET_REPO}/actions/variables/${GUARD_NAME}" -d "$(jq -nc --arg name "${GUARD_NAME}" --arg value true '{name:$name,value:$value}')")"
+                [ "${HTTP}" = 204 ] || exit 1
+              elif [ "${STATUS}" = 404 ]; then
+                echo "missing" > "${RUNNER_TEMP}/guard-state"
+                HTTP="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' "https://api.github.com/repos/${TARGET_REPO}/actions/variables" -d "$(jq -nc --arg name "${GUARD_NAME}" --arg value true '{name:$name,value:$value}')")"
+                [ "${HTTP}" = 201 ] || exit 1
+              else
+                exit 1
+              fi
+              echo "已设置 ${GUARD_NAME}=true。作者 Job 必须主动检查该变量。"
+              ;;
+          esac
+
+      - name: 推送原始 Tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "${WORK}"' EXIT
+          SOURCE_URL="https://github.com/${SOURCE_REPO}.git"
+          TARGET_URL="https://x-access-token:${TOKEN}@github.com/${TARGET_REPO}.git"
+          git -C "${WORK}" init -q
+          git -C "${WORK}" remote add upstream "${SOURCE_URL}"
+
+          if [ "${{ inputs.sync_scope }}" = selected ]; then
+            printf '%s' "${SELECTED_JSON}"|jq -r '.[].tagName'|sort -u > "${WORK}/candidates"
+          else
+            git ls-remote --tags --refs "${SOURCE_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${WORK}/source"
+            git ls-remote --tags --refs "${TARGET_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${WORK}/target"
+            comm -23 "${WORK}/source" "${WORK}/target" > "${WORK}/candidates"
+          fi
+
+          OK=0
+          SKIP=0
+          FAIL=0
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            if git ls-remote --exit-code --tags --refs "${TARGET_URL}" "refs/tags/${tag}" >/dev/null 2>&1; then SKIP=$((SKIP+1));continue;fi
+            if git -C "${WORK}" fetch --force upstream "refs/tags/${tag}:refs/tags/${tag}" && git -C "${WORK}" push "${TARGET_URL}" "refs/tags/${tag}:refs/tags/${tag}"; then
+              OK=$((OK+1))
+            else
+              FAIL=$((FAIL+1))
+            fi
+          done < "${WORK}/candidates"
+          echo "原始 Tag 成功：${OK}；跳过：${SKIP}；失败：${FAIL}"
+          [ "${FAIL}" -eq 0 ]
+
+      - name: 恢复变量保护原值
+        if: ${{ always() && inputs.original_tag_protection == 'repository_variable_guard' && inputs.restore_guard_variable }}
+        shell: bash
+        run: |
+          set -u
+          [ -f "${RUNNER_TEMP}/guard-state" ] || exit 0
+          STATE="$(cat "${RUNNER_TEMP}/guard-state")"
+          if [ "${STATE}" = exists ]; then
+            OLD="$(cat "${RUNNER_TEMP}/guard-old")"
+            HTTP="$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' "https://api.github.com/repos/${TARGET_REPO}/actions/variables/${GUARD_NAME}" -d "$(jq -nc --arg name "${GUARD_NAME}" --arg value "${OLD}" '{name:$name,value:$value}')")"
+            [ "${HTTP}" = 204 ] || exit 1
+          else
+            HTTP="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer ${TOKEN}" -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${TARGET_REPO}/actions/variables/${GUARD_NAME}")"
+            [ "${HTTP}" = 204 ] || exit 1
+          fi
+
+  sync-clean-tags:
+    name: 创建清理后的源码快照 Tag
+    needs: prepare
+    if: ${{ inputs.run_sync_tags && needs.prepare.outputs.source_kind == 'github' && inputs.tag_sync_mode == 'clean_snapshot' }}
+    runs-on: ubuntu-24.04
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+      SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
+      TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
+      SELECTED_JSON: ${{ needs.prepare.outputs.docker_versions_json || needs.prepare.outputs.selected_json }}
+      REMOVE_PATHS: ${{ inputs.clean_remove_paths }}
+    steps:
+      - name: 创建不含指定路径的新根提交并推送同名 Tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_URL="https://github.com/${SOURCE_REPO}.git"
+          TARGET_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${TARGET_REPO}.git"
+          CONTROL="$(mktemp -d)"
+          trap 'rm -rf "${CONTROL}"' EXIT
+
+          git -C "${CONTROL}" init -q
+          git -C "${CONTROL}" remote add upstream "${SOURCE_URL}"
+          git -C "${CONTROL}" config user.name "github-actions[bot]"
+          git -C "${CONTROL}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ "${{ inputs.sync_scope }}" = selected ]; then
+            printf '%s' "${SELECTED_JSON}" | jq -r '.[].tagName' | awk '!seen[$0]++' > "${CONTROL}/candidates"
+          else
+            git ls-remote --tags --refs "${SOURCE_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${CONTROL}/source"
+            git ls-remote --tags --refs "${TARGET_URL}"|awk '{sub("refs/tags/","",$2);print $2}'|sort -u > "${CONTROL}/target"
+            comm -23 "${CONTROL}/source" "${CONTROL}/target" > "${CONTROL}/candidates"
+          fi
+
+          OK=0
+          SKIP=0
+          FAIL=0
+          while IFS= read -r tag; do
+            [ -n "${tag}" ] || continue
+            echo "=========================================="
+            echo "创建清理快照：${tag}"
+            echo "=========================================="
+
+            FORCE_UPDATE=false
+            TARGET_TAG_EXISTS=false
+            if git ls-remote --exit-code --tags --refs "${TARGET_URL}" "refs/tags/${tag}" >/dev/null 2>&1; then
+              TARGET_TAG_EXISTS=true
+              if [ "${{ inputs.sync_scope }}" = selected ]; then
+                echo "目标 Tag 已存在，但 selected/range 明确要求处理，将重新生成并比较：${tag}"
+                FORCE_UPDATE=true
+              else
+                EXISTING_REPO="$(mktemp -d)"
+                git -C "${EXISTING_REPO}" init -q
+                git -C "${EXISTING_REPO}" fetch --quiet --depth 1 "${TARGET_URL}" "refs/tags/${tag}:refs/tags/existing-${tag}"
+                EXISTING_COMMIT="$(git -C "${EXISTING_REPO}" rev-list -n 1 "refs/tags/existing-${tag}")"
+                EXISTING_SUBJECT="$(git -C "${EXISTING_REPO}" show -s --format='%s' "${EXISTING_COMMIT}")"
+                rm -rf "${EXISTING_REPO}"
+                if [[ "${EXISTING_SUBJECT}" == Clean\ snapshot\ of* ]]; then
+                  echo "检测到旧 Clean snapshot Tag，将自动重建：${tag}"
+                  FORCE_UPDATE=true
+                else
+                  echo "目标 Tag 已存在且不是旧 Clean snapshot，all_missing 模式安全跳过：${tag}"
+                  SKIP=$((SKIP+1))
+                  continue
+                fi
+              fi
+            fi
+
+            SNAPSHOT="$(mktemp -d)"
+            REPO="$(mktemp -d)"
+
+            if ! git archive --remote="${SOURCE_URL}" "refs/tags/${tag}" | tar -x -C "${SNAPSHOT}"; then
+              echo "远程 archive 不可用，回退到浅克隆指定 Tag。"
+              rm -rf "${SNAPSHOT}"
+              SNAPSHOT="$(mktemp -d)"
+              if ! git clone --quiet --depth 1 --branch "${tag}" "${SOURCE_URL}" "${SNAPSHOT}"; then
+                echo "::warning::取得源码失败：${tag}"
+                rm -rf "${SNAPSHOT}" "${REPO}"
+                FAIL=$((FAIL+1))
+                continue
+              fi
+              rm -rf "${SNAPSHOT}/.git"
+            fi
+
+            for remove_path in ${REMOVE_PATHS}; do
+              if [ -e "${SNAPSHOT}/${remove_path}" ]; then
+                echo "删除：${remove_path}"
+                rm -rf "${SNAPSHOT:?}/${remove_path}"
+              else
+                echo "路径不存在，忽略：${remove_path}"
+              fi
+            done
+
+            git -C "${REPO}" init -q
+            git -C "${REPO}" config user.name "github-actions[bot]"
+            git -C "${REPO}" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            cp -a "${SNAPSHOT}/." "${REPO}/"
+            git -C "${REPO}" add -A
+            TREE_ID="$(git -C "${REPO}" write-tree)"
+
+            git -C "${CONTROL}" fetch --force --depth 1 upstream "refs/tags/${tag}:refs/tags/source-${tag}"
+            SOURCE_COMMIT="$(git -C "${CONTROL}" rev-list -n 1 "refs/tags/source-${tag}")"
+            SOURCE_AUTHOR_NAME="$(git -C "${CONTROL}" show -s --format='%an' "${SOURCE_COMMIT}")"
+            SOURCE_AUTHOR_EMAIL="$(git -C "${CONTROL}" show -s --format='%ae' "${SOURCE_COMMIT}")"
+            SOURCE_AUTHOR_DATE="$(git -C "${CONTROL}" show -s --format='%aI' "${SOURCE_COMMIT}")"
+            SOURCE_COMMITTER_NAME="$(git -C "${CONTROL}" show -s --format='%cn' "${SOURCE_COMMIT}")"
+            SOURCE_COMMITTER_EMAIL="$(git -C "${CONTROL}" show -s --format='%ce' "${SOURCE_COMMIT}")"
+            SOURCE_COMMITTER_DATE="$(git -C "${CONTROL}" show -s --format='%cI' "${SOURCE_COMMIT}")"
+            git -C "${CONTROL}" show -s --format='%B' "${SOURCE_COMMIT}" > "${REPO}/source-commit-message.txt"
+            COMMIT_ID="$(GIT_AUTHOR_NAME="${SOURCE_AUTHOR_NAME}" GIT_AUTHOR_EMAIL="${SOURCE_AUTHOR_EMAIL}" GIT_AUTHOR_DATE="${SOURCE_AUTHOR_DATE}" GIT_COMMITTER_NAME="${SOURCE_COMMITTER_NAME}" GIT_COMMITTER_EMAIL="${SOURCE_COMMITTER_EMAIL}" GIT_COMMITTER_DATE="${SOURCE_COMMITTER_DATE}" git -C "${REPO}" commit-tree "${TREE_ID}" < "${REPO}/source-commit-message.txt")"
+            rm -f "${REPO}/source-commit-message.txt"
+            git -C "${REPO}" update-ref "refs/tags/${tag}" "${COMMIT_ID}"
+
+            echo "新根提交：${COMMIT_ID}"
+            echo "该提交没有上游父提交，因此不会把作者 workflow 历史带入目标 Tag。"
+
+            PUSH_SUCCEEDED=false
+            for push_round in 1 2 3 4; do
+              PUSH_ARGS=("${TARGET_URL}" "refs/tags/${tag}:refs/tags/${tag}")
+              [ "${FORCE_UPDATE}" = true ] && PUSH_ARGS=(--force "${PUSH_ARGS[@]}")
+
+              if git -C "${REPO}" push "${PUSH_ARGS[@]}"; then
+                PUSH_SUCCEEDED=true
+                break
+              fi
+
+              echo "::warning::清理 Tag 推送发生并发更新，第 ${push_round}/4 次重试：${tag}"
+              sleep $((push_round*3))
+            done
+
+            if [ "${PUSH_SUCCEEDED}" = true ]; then
+              OK=$((OK+1))
+            else
+              echo "::warning::推送清理 Tag 多次重试仍失败：${tag}"
+              FAIL=$((FAIL+1))
+            fi
+
+            rm -rf "${SNAPSHOT}" "${REPO}"
+          done < "${CONTROL}/candidates"
+
+          echo "清理 Tag 成功：${OK}；跳过：${SKIP}；失败：${FAIL}"
+          [ "${FAIL}" -eq 0 ]
 
   copy-release:
+    name: 搬运 Release，独立于 Tag 同步
     needs: prepare
-    if: ${{ inputs.operation == 'copy_release' }}
+    if: ${{ inputs.run_copy_release }}
     runs-on: ubuntu-24.04
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SRC_REPO: ${{ needs.prepare.outputs.src_repo }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
+      SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
-      OVERWRITE: ${{ inputs.overwrite_assets }}
+      SELECTED_COUNT: ${{ needs.prepare.outputs.selected_count }}
+      RELEASE_UPDATE_MODE: ${{ inputs.release_update_mode }}
+      CLEAN_REMOVE_PATHS: ${{ inputs.clean_remove_paths }}
+      CLEAN_PUSH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RUN_SYNC_TAGS: ${{ inputs.run_sync_tags }}
+      SELECTED_TAG_SYNC_MODE: ${{ inputs.tag_sync_mode }}
     steps:
-      - name: 搬运 Release 标题、说明、状态和附件
+      - name: 搬运标题、说明、状态和附件
         shell: bash
         run: |
           set -euo pipefail
-          printf '%s' "${SELECTED_JSON}" > "${RUNNER_TEMP}/selected.json"; OK=0; FAIL=0
+          SELECTED="${RUNNER_TEMP}/selected.json"
+          FAILED_FILE="${RUNNER_TEMP}/failed-releases.txt"
+          printf '%s' "${SELECTED_JSON}" | jq 'sort_by([(.publishedAt // .createdAt), .tagName])' > "${SELECTED}"
+          echo "Release 重新整理后的处理顺序："
+          jq -r '.[].tagName' "${SELECTED}" | nl -ba
+          : > "${FAILED_FILE}"
+          OK=0
+          FAIL=0
+          CURRENT=0
+
+          repair_legacy_clean_tag_for_release() {
+            local tag="$1"
+            local target_url="https://x-access-token:${CLEAN_PUSH_TOKEN}@github.com/${TARGET_REPO}.git"
+            local source_url="https://github.com/${SOURCE_REPO}.git"
+            local check_dir source_dir new_repo existing_commit existing_subject source_commit tree_id commit_id
+
+            if ! git ls-remote --exit-code --tags --refs "${target_url}" "refs/tags/${tag}" >/dev/null 2>&1; then
+              return 0
+            fi
+
+            check_dir="$(mktemp -d)"
+            git -C "${check_dir}" init -q
+            git -C "${check_dir}" fetch --quiet --depth 1 "${target_url}" "refs/tags/${tag}:refs/tags/existing"
+            existing_commit="$(git -C "${check_dir}" rev-list -n 1 refs/tags/existing)"
+            existing_subject="$(git -C "${check_dir}" show -s --format='%s' "${existing_commit}")"
+
+            if [[ "${existing_subject}" != Clean\ snapshot\ of* ]]; then
+              rm -rf "${check_dir}"
+              return 0
+            fi
+
+            echo "metadata_only 检测到旧 Clean snapshot Tag，自动修复：${tag}"
+            source_dir="$(mktemp -d)"
+            new_repo="$(mktemp -d)"
+            git clone --quiet --depth 1 --branch "${tag}" "${source_url}" "${source_dir}"
+            rm -rf "${source_dir}/.git"
+            for remove_path in ${CLEAN_REMOVE_PATHS}; do rm -rf "${source_dir:?}/${remove_path}"; done
+
+            git -C "${check_dir}" fetch --force --depth 1 "${source_url}" "refs/tags/${tag}:refs/tags/source"
+            source_commit="$(git -C "${check_dir}" rev-list -n 1 refs/tags/source)"
+            git -C "${new_repo}" init -q
+            cp -a "${source_dir}/." "${new_repo}/"
+            git -C "${new_repo}" add -A
+            tree_id="$(git -C "${new_repo}" write-tree)"
+            git -C "${check_dir}" show -s --format='%B' "${source_commit}" > "${new_repo}/message.txt"
+            commit_id="$(GIT_AUTHOR_NAME="$(git -C "${check_dir}" show -s --format='%an' "${source_commit}")" GIT_AUTHOR_EMAIL="$(git -C "${check_dir}" show -s --format='%ae' "${source_commit}")" GIT_AUTHOR_DATE="$(git -C "${check_dir}" show -s --format='%aI' "${source_commit}")" GIT_COMMITTER_NAME="$(git -C "${check_dir}" show -s --format='%cn' "${source_commit}")" GIT_COMMITTER_EMAIL="$(git -C "${check_dir}" show -s --format='%ce' "${source_commit}")" GIT_COMMITTER_DATE="$(git -C "${check_dir}" show -s --format='%cI' "${source_commit}")" git -C "${new_repo}" commit-tree "${tree_id}" < "${new_repo}/message.txt")"
+            git -C "${new_repo}" update-ref "refs/tags/${tag}" "${commit_id}"
+
+            TAG_PUSH_OK=false
+            for tag_push_round in 1 2 3 4; do
+              if git -C "${new_repo}" push --force "${target_url}" "refs/tags/${tag}:refs/tags/${tag}"; then
+                TAG_PUSH_OK=true
+                break
+              fi
+              echo "::warning::metadata_only 修复 Tag 遇到并发更新，第 ${tag_push_round}/4 次重试：${tag}"
+              sleep $((tag_push_round*3))
+            done
+
+            rm -rf "${check_dir}" "${source_dir}" "${new_repo}"
+            [ "${TAG_PUSH_OK}" = true ] || return 1
+          }
           while IFS= read -r tag; do
-            W="$(mktemp -d)"; mkdir -p "${W}/assets"
-            if ! gh release view "${tag}" -R "${SRC_REPO}" --json name,body,isDraft,isPrerelease,tagName > "${W}/i.json"; then FAIL=$((FAIL+1)); rm -rf "${W}"; continue; fi
-            title="$(jq -r '.name//.tagName' "${W}/i.json")"; jq -r '.body//""' "${W}/i.json" > "${W}/body"; draft="$(jq -r .isDraft "${W}/i.json")"; pre="$(jq -r .isPrerelease "${W}/i.json")"
-            gh release download "${tag}" -R "${SRC_REPO}" -D "${W}/assets" || true
-            if gh release view "${tag}" -R "${TARGET_REPO}" >/dev/null 2>&1; then args=(release edit "${tag}" -R "${TARGET_REPO}" --title "${title}" --notes-file "${W}/body" --draft="${draft}" --prerelease="${pre}"); else args=(release create "${tag}" -R "${TARGET_REPO}" --title "${title}" --notes-file "${W}/body"); git ls-remote --exit-code --tags --refs "https://github.com/${TARGET_REPO}.git" "refs/tags/${tag}" >/dev/null 2>&1 && args+=(--verify-tag); [ "${draft}" = true ] && args+=(--draft); [ "${pre}" = true ] && args+=(--prerelease); fi
-            if gh "${args[@]}"; then mapfile -d '' files < <(find "${W}/assets" -maxdepth 1 -type f -print0); if [ "${#files[@]}" -gt 0 ]; then up=(release upload "${tag}" -R "${TARGET_REPO}"); [ "${OVERWRITE}" = true ] && up+=(--clobber); up+=("${files[@]}"); gh "${up[@]}"; fi; OK=$((OK+1)); else FAIL=$((FAIL+1)); fi
-            rm -rf "${W}"
-          done < <(jq -r '.[].tagName' "${RUNNER_TEMP}/selected.json")
-          echo "成功 ${OK}，失败 ${FAIL}"; [ "${FAIL}" -eq 0 ]
+            [ -n "${tag}" ] || continue
+            CURRENT=$((CURRENT+1))
+            WORK="$(mktemp -d)"
+            mkdir -p "${WORK}/assets"
+            echo "[${CURRENT}/${SELECTED_COUNT}] ${tag}"
+            if ! gh release view "${tag}" --repo "${SOURCE_REPO}" --json name,body,isDraft,isPrerelease,tagName > "${WORK}/info.json"; then
+              echo "${tag}" >> "${FAILED_FILE}";FAIL=$((FAIL+1));rm -rf "${WORK}";continue
+            fi
+            TITLE="$(jq -r '.name//.tagName' "${WORK}/info.json")"
+            jq -r '.body//""' "${WORK}/info.json" > "${WORK}/body.md"
+            DRAFT="$(jq -r .isDraft "${WORK}/info.json")"
+            PRE="$(jq -r .isPrerelease "${WORK}/info.json")"
+            if [ "${RELEASE_UPDATE_MODE}" = metadata_only ]; then
+              if [ "${RUN_SYNC_TAGS}" = true ] && [ "${SELECTED_TAG_SYNC_MODE}" = clean_snapshot ]; then
+                echo "本次已同时运行 clean_snapshot，Tag 修复交由 sync-clean-tags Job 独占执行，Release Job 不重复推送：${tag}"
+              else
+                repair_legacy_clean_tag_for_release "${tag}"
+              fi
+              echo "仅更新版本信息，不处理附件：${tag}"
+            else
+              gh release download "${tag}" --repo "${SOURCE_REPO}" --dir "${WORK}/assets" || true
+            fi
+
+            TARGET_RELEASE_EXISTS=false
+            gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1 && TARGET_RELEASE_EXISTS=true
+            if [ "${TARGET_RELEASE_EXISTS}" = true ] && [ "${RELEASE_UPDATE_MODE}" = overwrite_all_assets ]; then
+              gh release delete "${tag}" --repo "${TARGET_REPO}" --yes
+              TARGET_RELEASE_EXISTS=false
+              for wait_round in 1 2 3 4 5 6; do
+                ! gh release view "${tag}" --repo "${TARGET_REPO}" >/dev/null 2>&1 && break
+                sleep 3
+              done
+            fi
+            if [ "${TARGET_RELEASE_EXISTS}" = true ]; then
+              ARGS=(release edit "${tag}" --repo "${TARGET_REPO}" --title "${TITLE}" --notes-file "${WORK}/body.md" --draft="${DRAFT}" --prerelease="${PRE}")
+            else
+              ARGS=(release create "${tag}" --repo "${TARGET_REPO}" --title "${TITLE}" --notes-file "${WORK}/body.md")
+              git ls-remote --exit-code --tags --refs "https://github.com/${TARGET_REPO}.git" "refs/tags/${tag}" >/dev/null 2>&1 && ARGS+=(--verify-tag)
+              [ "${DRAFT}" = true ] && ARGS+=(--draft)
+              [ "${PRE}" = true ] && ARGS+=(--prerelease)
+            fi
+            if gh "${ARGS[@]}"; then
+              ASSET_FAILURES=0
+              if [ "${RELEASE_UPDATE_MODE}" = metadata_only ]; then
+                if [ "${RUN_SYNC_TAGS}" = true ] && [ "${SELECTED_TAG_SYNC_MODE}" = clean_snapshot ]; then
+                  echo "Release ${tag} 已更新版本信息；Tag 由并行的 Clean Job 修复；附件未读取、未删除、未上传。"
+                else
+                  echo "Release ${tag} 已更新版本信息，并已检查旧 Clean snapshot Tag；附件未读取、未删除、未上传。"
+                fi
+              else
+                mapfile -d '' ASSETS < <(find "${WORK}/assets" -maxdepth 1 -type f -print0)
+                gh api "repos/${TARGET_REPO}/releases/tags/${tag}" > "${WORK}/target-release.json" || true
+                jq -r '.assets[]?.name' "${WORK}/target-release.json" 2>/dev/null | sort -u > "${WORK}/target-assets.txt"
+                for asset_path in "${ASSETS[@]}"; do
+                  asset_name="$(basename "${asset_path}")"
+                  if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ] && grep -Fxq "${asset_name}" "${WORK}/target-assets.txt"; then
+                    echo "目标已有同名附件，保留并跳过：${asset_name}"
+                    continue
+                  fi
+                  if ! gh release upload "${tag}" --repo "${TARGET_REPO}" "${asset_path}"; then
+                    if [ "${RELEASE_UPDATE_MODE}" = keep_existing_assets ]; then
+                      echo "::warning::附件上传冲突，保留目标附件并跳过：${asset_name}"
+                    else
+                      ASSET_FAILURES=$((ASSET_FAILURES+1))
+                    fi
+                  fi
+                done
+              fi
+              if [ "${ASSET_FAILURES}" -eq 0 ]; then OK=$((OK+1)); else FAIL=$((FAIL+1)); fi
+            else
+              echo "${tag}" >> "${FAILED_FILE}"
+              FAIL=$((FAIL+1))
+            fi
+            rm -rf "${WORK}"
+          done < <(jq -r '.[].tagName' "${SELECTED}")
+          echo "Release 成功：${OK}；失败：${FAIL}"
+          [ "${FAIL}" -eq 0 ] || { cat "${FAILED_FILE}";exit 1; }
 
   copy-docker:
+    name: 直接搬运多个 Docker 多架构镜像
     needs: prepare
-    if: ${{ inputs.operation == 'copy_docker' }}
+    if: ${{ inputs.run_copy_docker }}
     runs-on: ubuntu-24.04
     env:
-      SRC_REPO: ${{ needs.prepare.outputs.src_repo }}
+      SOURCE_REPO: ${{ needs.prepare.outputs.src_repo }}
       TARGET_REPO: ${{ needs.prepare.outputs.target_repo }}
       IMAGE_MAPPINGS: ${{ inputs.image_mappings }}
-      SELECTED_JSON: ${{ needs.prepare.outputs.selected_json }}
+      SOURCE_KIND: ${{ needs.prepare.outputs.source_kind }}
+      SELECTED_JSON: ${{ needs.prepare.outputs.docker_versions_json }}
+      SELECTED_COUNT: ${{ needs.prepare.outputs.docker_versions_count }}
+      TAG_SYNC_MODE: ${{ inputs.tag_sync_mode }}
       SKIP_EXISTING: ${{ inputs.docker_skip_existing }}
-      STRIP_V: ${{ inputs.strip_v_prefix }}
+      STRIP_V_PREFIX: ${{ inputs.strip_v_prefix }}
       UPDATE_LATEST: ${{ inputs.update_latest }}
       GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GITHUB_TOKEN }}
       SOURCE_USERNAME: ${{ secrets.SOURCE_REGISTRY_USERNAME }}
       SOURCE_TOKEN: ${{ secrets.SOURCE_REGISTRY_TOKEN }}
     steps:
@@ -273,29 +1011,406 @@ jobs:
           set -euo pipefail
           go install github.com/google/go-containerregistry/cmd/crane@v0.20.3
           echo "${HOME}/go/bin" >> "${GITHUB_PATH}"
-      - name: 登录目标 GHCR
-        run: |
-          set -euo pipefail
-          printf '%s' "${GHCR_TOKEN}" | "${HOME}/go/bin/crane" auth login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
-      - name: 直接搬运一个或多个多架构镜像
+          "${HOME}/go/bin/crane" version
+
+      - name: Docker 地址为空时自动查找源码镜像与 GitHub Packages
+        id: discover_images
+        if: ${{ inputs.image_mappings == '' }}
         shell: bash
         run: |
           set -euo pipefail
-          CRANE="${HOME}/go/bin/crane"; MAP="${RUNNER_TEMP}/maps"; : > "${MAP}"
-          if [ -z "${IMAGE_MAPPINGS}" ]; then printf '%s\t%s\n' "ghcr.io/${SRC_REPO,,}" "${TARGET_REPO#*/}" >> "${MAP}"; else
-            printf '%s' "${IMAGE_MAPPINGS}" | tr ';；' '\n\n' | sed '/^$/d' | while IFS= read -r m; do m="$(printf '%s' "${m}"|xargs)"; if [[ "${m}" == *"="* ]]; then s="${m%%=*}"; n="${m#*=}"; else s="${m}"; n="${s##*/}"; fi; s="${s,,}"; n="${n,,}"; [[ "${s}" != *"@"* ]] || { echo "::error::源镜像不能含 Digest"; exit 1; }; printf '%s\t%s\n' "${s}" "${n}" >> "${MAP}"; done
+          [ "${SOURCE_REPO}" != "none" ] || { echo "::error::src_repo=none 无上游可扫描，请填写 image_mappings"; exit 1; }
+          WORK="$(mktemp -d)"; SRC_DIR="${WORK}/source"; OUT="${RUNNER_TEMP}/auto-image-mappings.tsv"
+          COMPOSE_OUT="${RUNNER_TEMP}/compose-image-mappings.tsv"; PACKAGE_OUT="${RUNNER_TEMP}/package-image-mappings.tsv"
+          trap 'rm -rf "${WORK}"' EXIT
+          :>"${COMPOSE_OUT}"; :>"${PACKAGE_OUT}"
+          if [ "${SOURCE_KIND}" = "github" ]; then
+            gh api -H 'Accept: application/vnd.github+json' "repos/${SOURCE_REPO}/tarball" > "${WORK}/source.tar.gz"
+            mkdir -p "${SRC_DIR}"; tar -xzf "${WORK}/source.tar.gz" -C "${SRC_DIR}" --strip-components=1
+          elif [ "${SOURCE_KIND}" = "external_git" ]; then
+            git clone --depth 1 "${SOURCE_REPO}" "${SRC_DIR}"
+          else
+            echo "::error::当前源类型不支持自动发现：${SOURCE_KIND}"; exit 1
           fi
-          sort -u "${MAP}" -o "${MAP}"; printf '%s' "${SELECTED_JSON}" > "${RUNNER_TEMP}/versions.json"
-          if [ -n "${SOURCE_USERNAME}" ] && [ -n "${SOURCE_TOKEN}" ]; then cut -f1 "${MAP}"|awk -F/ '{print $1}'|sort -u|while read -r r; do printf '%s' "${SOURCE_TOKEN}"|"${CRANE}" auth login "${r}" --username "${SOURCE_USERNAME}" --password-stdin; done; fi
-          OK=0; SKIP=0; MISS=0; FAIL=0
-          while IFS=$'\t' read -r src name; do
-            target="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${name}"; last=""
-            while IFS= read -r reltag; do st="${reltag}"; [ "${STRIP_V}" = true ] && st="${st#v}"; sref="${src}:${st}"; tref="${target}:${reltag}"
-              echo "${sref} -> ${tref}"
-              if ! "${CRANE}" manifest "${sref}" >/dev/null 2>&1; then echo "::warning::源镜像不存在：${sref}"; MISS=$((MISS+1)); continue; fi
-              if [ "${SKIP_EXISTING}" = true ] && "${CRANE}" manifest "${tref}" >/dev/null 2>&1; then echo "已存在，跳过"; SKIP=$((SKIP+1)); continue; fi
-              if "${CRANE}" copy "${sref}" "${tref}"; then echo "复制成功，摘要：$("${CRANE}" digest "${tref}")"; last="${sref}"; OK=$((OK+1)); else FAIL=$((FAIL+1)); fi
-            done < <(jq -r '.[].tagName' "${RUNNER_TEMP}/versions.json")
-            if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then "${CRANE}" copy "${last}" "${target}:latest" || FAIL=$((FAIL+1)); fi
+          python3 -m pip install --disable-pip-version-check --quiet pyyaml
+          python3 - "${SRC_DIR}" "${COMPOSE_OUT}" <<'PYCODE'
+          import re, sys, yaml
+          from pathlib import Path
+          root,out=Path(sys.argv[1]),Path(sys.argv[2]); images=set(); local=set()
+          ignored={'.git','vendor','node_modules','dist','build','.cache'}
+          def norm(v):
+              if not isinstance(v,str): return None
+              v=v.strip().strip('"').strip("'")
+              if not v or '$' in v: return None
+              v=v.split('@',1)[0]; last=v.rsplit('/',1)[-1]
+              if ':' in last: v=v.rsplit(':',1)[0]
+              if '/' not in v: v='docker.io/library/'+v
+              elif not any(c in v.split('/',1)[0] for c in '.:'): v='docker.io/'+v
+              return v.lower().strip('/')
+          for path in root.rglob('*'):
+              if not path.is_file() or any(x in ignored for x in path.parts): continue
+              if re.fullmatch(r'(docker-)?compose[^/]*\.ya?ml',path.name,re.I):
+                  try: data=yaml.safe_load(path.read_text(encoding='utf-8',errors='ignore')) or {}
+                  except Exception as e: print(f'warning: skip {path}: {e}',file=sys.stderr); continue
+                  services=data.get('services') if isinstance(data,dict) else None
+                  if not isinstance(services,dict): continue
+                  for name,cfg in services.items():
+                      if not isinstance(cfg,dict): continue
+                      img=norm(cfg.get('image'))
+                      if not img: continue
+                      if cfg.get('build') is not None: local.add(img); print(f'跳过本地 build 镜像：{name} -> {img}',file=sys.stderr)
+                      else: images.add(img)
+          pat=re.compile(r'(?<![A-Za-z0-9_.-])((?:ghcr\.io|quay\.io|docker\.io)/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+(?::[A-Za-z0-9_.-]+)?)')
+          wf=root/'.github'/'workflows'
+          if wf.is_dir():
+              for path in list(wf.glob('*.yml'))+list(wf.glob('*.yaml')):
+                  for raw in pat.findall(path.read_text(encoding='utf-8',errors='ignore')):
+                      img=norm(raw)
+                      if img and img not in local: images.add(img)
+          targets={}
+          with out.open('w',encoding='utf-8') as f:
+              for img in sorted(images):
+                  target=re.sub(r'[^a-z0-9._-]+','-',img.rsplit('/',1)[-1]).strip('._-')
+                  if target in targets and targets[target]!=img: raise SystemExit(f'目标名冲突：{targets[target]} / {img} -> {target}')
+                  targets[target]=img; f.write(f'{img}\t{target}\t\n')
+          PYCODE
+
+          if [ "${SOURCE_KIND}" = "github" ]; then
+            OWNER="${SOURCE_REPO%%/*}"
+            REPO_NAME="${SOURCE_REPO#*/}"
+            OWNER_TYPE="$(gh api "repos/${SOURCE_REPO}" --jq '.owner.type')"
+            if [ "${OWNER_TYPE}" = "Organization" ]; then
+              PKG_ENDPOINT="/orgs/${OWNER}/packages"
+              PUBLIC_ENDPOINT="https://api.github.com/orgs/${OWNER}/packages"
+            else
+              PKG_ENDPOINT="/users/${OWNER}/packages"
+              PUBLIC_ENDPOINT="https://api.github.com/users/${OWNER}/packages"
+            fi
+
+            PACKAGES_OK=false
+            if gh api --paginate --slurp "${PKG_ENDPOINT}?package_type=container&per_page=100" > "${WORK}/packages.json" 2>"${WORK}/packages.err"; then
+              PACKAGES_OK=true
+              echo "使用当前 Token 枚举 GitHub Packages 成功。"
+            else
+              echo "::warning::当前 Token 无法枚举上游 Packages，自动改用匿名公共 API。"
+              :>"${WORK}/packages-flat.jsonl"
+              for page in $(seq 1 50); do
+                CODE="$(curl -sS -L -o "${WORK}/packages-page.json" -w '%{http_code}' \
+                  -H 'Accept: application/vnd.github+json' \
+                  -H 'X-GitHub-Api-Version: 2022-11-28' \
+                  "${PUBLIC_ENDPOINT}?package_type=container&per_page=100&page=${page}")"
+                [ "${CODE}" = 200 ] || { echo "匿名 Packages API HTTP ${CODE}"; break; }
+                COUNT="$(jq length "${WORK}/packages-page.json")"
+                [ "${COUNT}" -gt 0 ] || break
+                jq -c '.[]' "${WORK}/packages-page.json" >> "${WORK}/packages-flat.jsonl"
+                [ "${COUNT}" -lt 100 ] && break
+              done
+              if [ -s "${WORK}/packages-flat.jsonl" ]; then
+                jq -s '.' "${WORK}/packages-flat.jsonl" | jq -s '.' > "${WORK}/packages.json"
+                PACKAGES_OK=true
+                echo "匿名公共 API 枚举 GitHub Packages 成功。"
+              fi
+            fi
+
+            # Packages REST API 对公开包也可能要求 classic read:packages。
+            # API 认证和匿名请求都失败时，从公开 GitHub Packages 网页发现包名，
+            # 再直接用 crane ls 从 GHCR 读取真实标签，不依赖 Packages REST 权限。
+            WEB_PACKAGES="${WORK}/web-packages.txt"
+            :>"${WEB_PACKAGES}"
+            PACKAGE_PAGE_BASE=""
+            for candidate_base in \
+              "https://github.com/users/${OWNER}/packages" \
+              "https://github.com/orgs/${OWNER}/packages" \
+              "https://github.com/${OWNER}"; do
+              if [[ "${candidate_base}" == "https://github.com/${OWNER}" ]]; then
+                candidate_url="${candidate_base}?tab=packages&repo_name=${REPO_NAME}"
+              else
+                candidate_url="${candidate_base}?repo_name=${REPO_NAME}"
+              fi
+              CODE="$(curl -sS -L -o "${WORK}/packages-probe.html" -w '%{http_code}' -H 'Accept: text/html' -A 'Mozilla/5.0' "${candidate_url}")"
+              if [ "${CODE}" = 200 ] && grep -qiE '/(users|orgs)/[^/]+/packages/container/(package/)?' "${WORK}/packages-probe.html"; then
+                PACKAGE_PAGE_BASE="${candidate_base}"
+                echo "公开 Packages 页面可用：${candidate_url}"
+                break
+              fi
+              echo "Packages 页面探测未命中：HTTP ${CODE} ${candidate_url}"
+            done
+            if [ "${PACKAGES_OK}" != true ]; then
+              echo "REST API 不可用，开始抓取公开 Packages 网页。"
+              if [ -z "${PACKAGE_PAGE_BASE}" ]; then
+                echo "::warning::未探测到可用的公开 Packages 页面入口。"
+              fi
+              for page in $(seq 1 50); do
+                [ -n "${PACKAGE_PAGE_BASE}" ] || break
+                if [[ "${PACKAGE_PAGE_BASE}" == "https://github.com/${OWNER}" ]]; then
+                  PAGE_URL="${PACKAGE_PAGE_BASE}?tab=packages&repo_name=${REPO_NAME}&page=${page}"
+                else
+                  PAGE_URL="${PACKAGE_PAGE_BASE}?repo_name=${REPO_NAME}&page=${page}"
+                fi
+                CODE="$(curl -sS -L -o "${WORK}/packages-page.html" -w '%{http_code}' \
+                  -H 'Accept: text/html' -A 'Mozilla/5.0' "${PAGE_URL}")"
+                [ "${CODE}" = 200 ] || { echo "Packages 网页 HTTP ${CODE}：${PAGE_URL}"; break; }
+                HTML_FILE="${WORK}/packages-page.html" OWNER_VALUE="${OWNER}" REPO_VALUE="${REPO_NAME}" \
+                  python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/(?:users|orgs)/{re.escape(owner)}/packages/container/(?:package/)?([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
+                  >> "${WEB_PACKAGES}"
+                COUNT="$(sort -u "${WEB_PACKAGES}" | wc -l | xargs)"
+                echo "Packages 网页第 ${page} 页，累计发现 ${COUNT} 个包。"
+                grep -qiE 'Next|下一页' "${WORK}/packages-page.html" || break
+              done
+              sort -u "${WEB_PACKAGES}" -o "${WEB_PACKAGES}"
+              if [ -s "${WEB_PACKAGES}" ]; then
+                echo "公开 Packages 网页发现包：$(wc -l < "${WEB_PACKAGES}" | xargs) 个。"
+                while IFS= read -r NAME; do
+                  [ -n "${NAME}" ] || continue
+                  SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
+                  TAGS="$(crane ls "${SOURCE_IMAGE}" 2>/dev/null | sort -V | paste -sd, - || true)"
+                  if [ -z "${TAGS}" ]; then
+                    # 页面顶部会明确显示 latest；crane ls 被限流时仍先保留 latest。
+                    TAGS="latest"
+                    echo "::warning::无法列出 ${SOURCE_IMAGE} 的标签，回退尝试 latest。"
+                  fi
+                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "${TAGS}" >> "${PACKAGE_OUT}"
+                  echo "网页发现 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
+                done < "${WEB_PACKAGES}"
+              fi
+            fi
+
+            if [ "${PACKAGES_OK}" = true ]; then
+              jq -c --arg repo "${SOURCE_REPO}" --arg prefix "${REPO_NAME}/" '
+                [.[][]
+                  | select(
+                      ((.repository.full_name // "") | ascii_downcase) == ($repo | ascii_downcase)
+                      or (.name | ascii_downcase | startswith($prefix | ascii_downcase))
+                    )
+                ] | unique_by(.name) | .[]
+              ' "${WORK}/packages.json" > "${WORK}/selected-packages.jsonl"
+              FOUND_PACKAGES="$(wc -l < "${WORK}/selected-packages.jsonl" | xargs)"
+              echo "与 ${SOURCE_REPO} 关联或以 ${REPO_NAME}/ 开头的 Container Packages：${FOUND_PACKAGES} 个。"
+              if [ "${FOUND_PACKAGES}" -eq 0 ]; then
+                echo "::warning::Packages API 返回成功但没有关联包，补充抓取公开 Packages 网页。"
+                for page in $(seq 1 50); do
+                  [ -n "${PACKAGE_PAGE_BASE}" ] || break
+                  if [[ "${PACKAGE_PAGE_BASE}" == "https://github.com/${OWNER}" ]]; then
+                  PAGE_URL="${PACKAGE_PAGE_BASE}?tab=packages&repo_name=${REPO_NAME}&page=${page}"
+                else
+                  PAGE_URL="${PACKAGE_PAGE_BASE}?repo_name=${REPO_NAME}&page=${page}"
+                fi
+                  CODE="$(curl -sS -L -o "${WORK}/packages-page.html" -w '%{http_code}' -H 'Accept: text/html' -A 'Mozilla/5.0' "${PAGE_URL}")"
+                  [ "${CODE}" = 200 ] || break
+                  HTML_FILE="${WORK}/packages-page.html" OWNER_VALUE="${OWNER}" REPO_VALUE="${REPO_NAME}" \
+                    python3 -c 'import html,os,re; from pathlib import Path; from urllib.parse import unquote; text=html.unescape(Path(os.environ["HTML_FILE"]).read_text(encoding="utf-8",errors="ignore")); owner=os.environ["OWNER_VALUE"]; repo=os.environ["REPO_VALUE"]; pattern=rf"/(?:users|orgs)/{re.escape(owner)}/packages/container/(?:package/)?([^\"?#< ]+)"; print("\n".join(unquote(x).strip("/") for x in re.findall(pattern,text,re.I) if unquote(x).strip("/")))' \
+                    >> "${WEB_PACKAGES}"
+                  grep -qiE 'Next|下一页' "${WORK}/packages-page.html" || break
+                done
+                sort -u "${WEB_PACKAGES}" -o "${WEB_PACKAGES}"
+                while IFS= read -r NAME; do
+                  [ -n "${NAME}" ] || continue
+                  SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
+                  TAGS="$(crane ls "${SOURCE_IMAGE}" 2>/dev/null | sort -V | paste -sd, - || true)"
+                  [ -n "${TAGS}" ] || TAGS="latest"
+                  printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${NAME,,}" "${TAGS}" >> "${PACKAGE_OUT}"
+                  echo "网页补充 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
+                done < "${WEB_PACKAGES}"
+              fi
+
+              while IFS= read -r package; do
+                [ -n "${package}" ] || continue
+                NAME="$(jq -r '.name' <<<"${package}")"
+                ENCODED="$(jq -rn --arg v "${NAME}" '$v|@uri')"
+                VERSIONS_OK=false
+                if gh api --paginate --slurp "${PKG_ENDPOINT}/container/${ENCODED}/versions?per_page=100" > "${WORK}/versions.json" 2>/dev/null; then
+                  VERSIONS_OK=true
+                else
+                  :>"${WORK}/versions-flat.jsonl"
+                  for page in $(seq 1 50); do
+                    CODE="$(curl -sS -L -o "${WORK}/versions-page.json" -w '%{http_code}' \
+                      -H 'Accept: application/vnd.github+json' \
+                      -H 'X-GitHub-Api-Version: 2022-11-28' \
+                      "${PUBLIC_ENDPOINT}/container/${ENCODED}/versions?per_page=100&page=${page}")"
+                    [ "${CODE}" = 200 ] || break
+                    COUNT="$(jq length "${WORK}/versions-page.json")"
+                    [ "${COUNT}" -gt 0 ] || break
+                    jq -c '.[]' "${WORK}/versions-page.json" >> "${WORK}/versions-flat.jsonl"
+                    [ "${COUNT}" -lt 100 ] && break
+                  done
+                  if [ -s "${WORK}/versions-flat.jsonl" ]; then
+                    jq -s '.' "${WORK}/versions-flat.jsonl" | jq -s '.' > "${WORK}/versions.json"
+                    VERSIONS_OK=true
+                  fi
+                fi
+                if [ "${VERSIONS_OK}" != true ]; then
+                  echo "::warning::无法读取包版本，跳过：${NAME}"
+                  continue
+                fi
+                TAGS="$(jq -r '[.[][] | .metadata.container.tags[]?] | unique | sort_by(if .=="latest" then "zzzzzz" else . end) | join(",")' "${WORK}/versions.json")"
+                [ -n "${TAGS}" ] || { echo "GitHub Package 无标签，跳过：${NAME}"; continue; }
+                SOURCE_IMAGE="ghcr.io/${OWNER,,}/${NAME,,}"
+                TARGET_NAME="${NAME,,}"
+                printf '%s\t%s\t%s\n' "${SOURCE_IMAGE}" "${TARGET_NAME}" "${TAGS}" >> "${PACKAGE_OUT}"
+                echo "发现关联 GitHub Package：${SOURCE_IMAGE}；标签=${TAGS}"
+              done < "${WORK}/selected-packages.jsonl"
+            else
+              echo "::warning::认证及匿名方式均无法枚举 GitHub Packages。认证错误：$(cat "${WORK}/packages.err" 2>/dev/null || true)"
+            fi
+          fi
+          cat "${PACKAGE_OUT}" "${COMPOSE_OUT}" | awk -F '\t' '!seen[$1]++' > "${OUT}"
+          [ -s "${OUT}" ] || { echo "::error::没有从源码或 GitHub Packages 读取到镜像。若上游包公开但仍失败，请为 WORKFLOW_PAT 添加 classic read:packages；也可手动填写 image_mappings"; exit 1; }
+          echo "map_file=${OUT}" >> "${GITHUB_OUTPUT}"
+          echo "自动发现映射（第3列非空表示使用包自身标签）："; cat "${OUT}"
+
+      - name: 生成镜像映射
+        id: mappings
+        env:
+          AUTO_MAP_FILE: ${{ steps.discover_images.outputs.map_file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MAP="${RUNNER_TEMP}/maps.tsv"
+          AUTH_MAP="${RUNNER_TEMP}/registry-auth.tsv"
+          :>"${MAP}"; :>"${AUTH_MAP}"
+          if [ -z "${IMAGE_MAPPINGS}" ]; then
+            [ -n "${AUTO_MAP_FILE}" ] && [ -s "${AUTO_MAP_FILE}" ] || { echo "::error::Docker 地址栏为空且自动发现结果不可用"; exit 1; }
+            cp "${AUTO_MAP_FILE}" "${MAP}"
+            echo "Docker 地址栏为空：使用源码及 GitHub Packages 自动发现结果。"
+          else
+            while IFS= read -r item; do
+              item="$(printf '%s' "${item}" | xargs)"; [ -n "${item}" ] || continue
+              mapping="${item%%|*}"; credentials=""
+              [[ "${item}" == *"|"* ]] && credentials="${item#*|}"
+              if [[ "${mapping}" == *"="* ]]; then src="${mapping%%=*}"; name="${mapping#*=}"; else src="${mapping}"; name="${src##*/}"; fi
+              src="$(printf '%s' "${src}"|xargs)"; name="$(printf '%s' "${name}"|xargs)"
+              [ -n "${src}" ] && [ -n "${name}" ] || { echo "::error::Docker 映射格式错误：${mapping}"; exit 1; }
+              [[ "${src}" != *"@"* ]] || { echo "::error::源镜像不能包含 Digest"; exit 1; }
+              mapping_tag=""
+              source_last="${src##*/}"
+              if [[ "${source_last}" == *:* ]]; then
+                mapping_tag="${source_last##*:}"; src="${src%:*}"
+                [ -n "${mapping_tag}" ] || { echo "::error::源镜像 Tag 不能为空：${mapping}"; exit 1; }
+              fi
+              first_part="${src%%/*}"
+              if [[ "${src}" != */* ]]; then
+                src="docker.io/library/${src}"
+              elif [[ "${first_part}" != *.* && "${first_part}" != *:* && "${first_part}" != "localhost" ]]; then
+                src="docker.io/${src}"
+              fi
+              printf '%s\t%s\t%s\t%s\n' "${src,,}" "${name,,}" '__no_package_tags__' "${mapping_tag}" >> "${MAP}"
+              if [ -n "${mapping_tag}" ]; then
+                echo "独立 Tag 映射：${src,,}:${mapping_tag} -> ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${name,,}:${mapping_tag}"
+              fi
+              if [ -n "${credentials}" ]; then
+                [[ "${credentials}" == *"|"* ]] || { echo "::error::账号格式应为：源=目标|用户名|Token"; exit 1; }
+                username="${credentials%%|*}"; password="${credentials#*|}"
+                [ -n "${username}" ] && [ -n "${password}" ] || { echo "::error::用户名和 Token 均不能为空"; exit 1; }
+                registry="${src%%/*}"
+                printf '%s\t%s\t%s\n' "${registry,,}" "${username}" "${password}" >> "${AUTH_MAP}"
+                echo "::add-mask::${password}"
+              fi
+            done < <(printf '%s\n' "${IMAGE_MAPPINGS}" | sed 's/；/;/g; s/;/\n/g' | sed '/^[[:space:]]*$/d')
+          fi
+          sort -u "${MAP}" -o "${MAP}"
+          echo "Docker 映射："; awk -F '\t' '{print $1 " -> " $2}' "${MAP}"
+          echo "map_file=${MAP}" >> "${GITHUB_OUTPUT}"
+          echo "auth_file=${AUTH_MAP}" >> "${GITHUB_OUTPUT}"
+
+      - name: 登录源镜像仓库
+        env:
+          MAP: ${{ steps.mappings.outputs.map_file }}
+          AUTH_MAP: ${{ steps.mappings.outputs.auth_file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          login_one(){ local registry="$1" username="$2" password="$3"; echo "::add-mask::${password}"; echo "登录源镜像仓库：${registry}"; printf '%s' "${password}" | crane auth login "${registry}" --username "${username}" --password-stdin; }
+          if [ -s "${AUTH_MAP}" ]; then
+            while IFS=$'\t' read -r registry username password; do [ -n "${registry}" ] && login_one "${registry}" "${username}" "${password}"; done < "${AUTH_MAP}"
+          elif [ -n "${SOURCE_USERNAME}" ] || [ -n "${SOURCE_TOKEN}" ]; then
+            [ -n "${SOURCE_USERNAME}" ] && [ -n "${SOURCE_TOKEN}" ] || { echo "::error::SOURCE_REGISTRY_USERNAME 和 SOURCE_REGISTRY_TOKEN 必须同时设置"; exit 1; }
+            if cut -f1 "${MAP}" | awk -F/ '{print $1}' | grep -Fxq 'docker.io'; then
+              login_one "docker.io" "${SOURCE_USERNAME}" "${SOURCE_TOKEN}"
+              echo "全局 SOURCE_REGISTRY_USERNAME/TOKEN 仅应用于 docker.io；其他 Registry 保持匿名，或使用映射内独立账号。"
+            else
+              echo "映射中没有 docker.io，未使用全局 SOURCE_REGISTRY_USERNAME/TOKEN。"
+            fi
+          else
+            echo "未提供源镜像仓库账号，使用匿名访问。"
+          fi
+
+      - name: 登录目标 GHCR
+        run: |
+          set -euo pipefail
+          printf '%s' "${GHCR_TOKEN}" | crane auth login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: 复制完整多架构镜像
+        env:
+          MAP: ${{ steps.mappings.outputs.map_file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSIONS="${RUNNER_TEMP}/versions.json"; SUMMARY="${RUNNER_TEMP}/summary.txt"
+          printf '%s' "${SELECTED_JSON}" > "${VERSIONS}"; :>"${SUMMARY}"
+          MAP_COUNT="$(awk 'NF{n++}END{print n+0}' "${MAP}")"; VERSION_COUNT="$(jq length "${VERSIONS}")"
+          [ "${MAP_COUNT}" -gt 0 ] || { echo "::error::没有生成 Docker 映射"; exit 1; }
+          [ "${VERSION_COUNT}" -gt 0 ] || { echo "::error::没有选中 Docker 版本"; exit 1; }
+          echo "准备搬运：镜像映射 ${MAP_COUNT} 个，精准版本 ${VERSION_COUNT} 个。"
+          OK=0; SKIP=0; MISSING=0; FAIL=0
+          while IFS=$'\t' read -r source_image target_name package_tags mapping_tag; do
+            target_image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${target_name}"; last=""
+            TAG_FILE="${RUNNER_TEMP}/tags-$(printf '%s' "${target_name}" | tr '/:' '--').txt"
+            if [ -n "${mapping_tag:-}" ]; then
+              printf '%s\n' "${mapping_tag}" > "${TAG_FILE}"
+              echo "${source_image} 使用该映射自身独立 Tag：${mapping_tag}。"
+            elif [ -n "${package_tags:-}" ] && [ "${package_tags}" != '__no_package_tags__' ]; then
+              printf '%s' "${package_tags}" | tr ',' '\n' | sed '/^$/d' | sort -V > "${TAG_FILE}"
+              echo "${source_image} 使用 GitHub Package 自身标签，共 $(wc -l < "${TAG_FILE}" | xargs) 个。"
+            else
+              jq -r '.[].tagName | select(. != "__mapping_tag__")' "${VERSIONS}" > "${TAG_FILE}"
+              [ -s "${TAG_FILE}" ] || { echo "::error::${source_image} 没有独立 Tag，也没有公共 tag/tag_list"; FAIL=$((FAIL+1)); continue; }
+              echo "${source_image} 使用 Release/clean_snapshot 或公共版本列表。"
+            fi
+            while IFS= read -r release_tag; do
+              [ -n "${release_tag}" ] || continue
+              target_ref="${target_image}:${release_tag}"
+              CANDIDATES=()
+              if [ "${STRIP_V_PREFIX}" = true ] && [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}" "${release_tag}");
+              else CANDIDATES+=("${release_tag}"); if [[ "${release_tag}" == v* ]]; then CANDIDATES+=("${release_tag#v}"); else CANDIDATES+=("v${release_tag}"); fi; fi
+              source_ref=""; checked=""; probe_errors=""; only_not_found=true
+              for candidate in "${CANDIDATES[@]}"; do
+                ref="${source_image}:${candidate}"; checked="${checked:+${checked}, }${ref}"
+                PROBE_FILE="${RUNNER_TEMP}/crane-source-probe.txt"
+                if crane manifest "${ref}" > /dev/null 2>"${PROBE_FILE}"; then
+                  source_ref="${ref}"; break
+                fi
+                probe_message="$(tr '\n' ' ' < "${PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                [ -n "${probe_message}" ] || probe_message="crane manifest 未返回错误文本"
+                echo "::warning::源镜像检查失败：${ref} | ${probe_message}"
+                probe_errors="${probe_errors}${probe_errors:+ | }${ref}: ${probe_message}"
+                if ! printf '%s' "${probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
+                  only_not_found=false
+                fi
+              done
+              if [ -z "${source_ref}" ]; then
+                if [ "${only_not_found}" = true ]; then
+                  echo "源镜像确实不存在：${checked} | ${probe_errors}" >> "${SUMMARY}"; MISSING=$((MISSING+1))
+                else
+                  echo "源镜像检查错误：${checked} | ${probe_errors}" >> "${SUMMARY}"; FAIL=$((FAIL+1))
+                fi
+                continue
+              fi
+              if [ "${SKIP_EXISTING}" = true ]; then
+                TARGET_PROBE_FILE="${RUNNER_TEMP}/crane-target-probe.txt"
+                if crane manifest "${target_ref}" > /dev/null 2>"${TARGET_PROBE_FILE}"; then
+                  echo "跳过 ${target_ref}；latest 候选=${source_ref}" >> "${SUMMARY}"; last="${source_ref}"; SKIP=$((SKIP+1)); continue
+                fi
+                target_probe_message="$(tr '\n' ' ' < "${TARGET_PROBE_FILE}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')"
+                if [ -n "${target_probe_message}" ] && ! printf '%s' "${target_probe_message}" | grep -Eqi 'manifest unknown|name unknown|not found|404|unknown tag'; then
+                  echo "::warning::目标镜像存在性检查返回非缺失错误，将继续尝试复制：${target_ref} | ${target_probe_message}"
+                fi
+              fi
+              if crane copy "${source_ref}" "${target_ref}"; then echo "成功 ${source_ref} -> ${target_ref}" >> "${SUMMARY}"; last="${source_ref}"; OK=$((OK+1)); else echo "失败 ${source_ref}" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
+            done < "${TAG_FILE}"
+            if [ "${UPDATE_LATEST}" = true ] && [ -n "${last}" ]; then
+              if crane copy "${last}" "${target_image}:latest"; then echo "latest 更新成功：${last} -> ${target_image}:latest" >> "${SUMMARY}"; else echo "latest 更新失败：${last} -> ${target_image}:latest" >> "${SUMMARY}"; FAIL=$((FAIL+1)); fi
+            fi
           done < "${MAP}"
-          echo "成功 ${OK}，跳过 ${SKIP}，源缺失 ${MISS}，失败 ${FAIL}"; [ "${FAIL}" -eq 0 ]
+          echo "Docker 成功：${OK}；跳过：${SKIP}；缺失：${MISSING}；失败：${FAIL}"; cat "${SUMMARY}"
+          TOTAL=$((OK+SKIP+MISSING+FAIL)); [ "${TOTAL}" -gt 0 ] || { echo "::error::没有处理任何 Docker 镜像"; exit 1; }
+          [ "${FAIL}" -eq 0 ]
